@@ -1,0 +1,13 @@
+[project]
+name = "browseragent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "langchain-core",
+    "langchain-groq",
+    "playwright",
+    "psutil",
+    "python-dotenv"
+]
