@@ -1,6 +1,6 @@
 import asyncio
 from typing import List, Optional
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Playwright
 from utils.logger import setup_logger
 from config.settings import settings
 
@@ -13,15 +13,15 @@ class BrowserInstance:
         self.context = context
         self.page = page
         self.in_use = False
-        self.task_id = None
+        self.task_id: Optional[str] = None
 
 class BrowserPool:
     """Manages a pool of browser instances for parallel execution."""
     
-    def __init__(self, max_browsers: int = None, headless: bool = None):
+    def __init__(self, max_browsers: Optional[int] = None, headless: Optional[bool] = None):
         self.max_browsers = max_browsers or settings.MAX_BROWSERS
         self.headless = headless if headless is not None else settings.HEADLESS
-        self.playwright = None
+        self.playwright: Optional[Playwright] = None
         self.instances: List[BrowserInstance] = []
         self.lock = asyncio.Lock()
         
@@ -42,6 +42,9 @@ class BrowserPool:
             
             # Create new instance if under limit
             if len(self.instances) < self.max_browsers:
+                if self.playwright is None:
+                    raise RuntimeError("Browser pool not initialized. Call initialize() first.")
+                    
                 browser = await self.playwright.chromium.launch(headless=self.headless)
                 context = await browser.new_context()
                 page = await context.new_page()

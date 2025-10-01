@@ -1,7 +1,8 @@
 import difflib
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from playwright.async_api import Page
 from langchain_groq import ChatGroq
+from pydantic import SecretStr
 from utils.logger import setup_logger
 from utils.helpers import extract_number
 from config.settings import settings
@@ -12,10 +13,15 @@ class IntelligentElementFinder:
     """Advanced element finding with AI-powered reasoning."""
     
     def __init__(self, llm=None):
+        # Convert api_key to SecretStr if it exists
+        api_key = settings.GROQ_API_KEY
+        if api_key is None:
+            raise ValueError("GROQ_API_KEY is not set in environment variables")
+        
         self.llm = llm or ChatGroq(
             model=settings.LLM_MODEL,
             temperature=settings.LLM_TEMPERATURE,
-            api_key=settings.GROQ_API_KEY
+            api_key=SecretStr(api_key) if isinstance(api_key, str) else api_key
         )
     
     async def find_element_intelligently(self, page: Page, description: str, 
@@ -194,7 +200,21 @@ Respond with ONLY the number (0-{len(element_summaries)-1}) of the best match, o
 
         try:
             response = await self.llm.ainvoke([{"role": "user", "content": prompt}])
-            response_text = response.content.strip()
+            
+            # Handle response content which can be a string or a list of content blocks
+            if isinstance(response.content, str):
+                response_text = response.content.strip()
+            elif isinstance(response.content, list):
+                # Extract text from content blocks
+                response_text = ""
+                for item in response.content:
+                    if isinstance(item, dict) and "text" in item:
+                        response_text += item["text"]
+                    elif isinstance(item, str):
+                        response_text += item
+                response_text = response_text.strip()
+            else:
+                response_text = str(response.content).strip()
             
             index = extract_number(response_text)
             
