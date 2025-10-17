@@ -136,12 +136,15 @@ class BrowserPool:
         self._instance_counter += 1
         instance_id = f"browser_{self._instance_counter}"
         
+        # Store playwright reference to help type checker
+        playwright = self.playwright
+        
         try:
             logger.info(f"Creating new browser instance {instance_id}")
             
             # Fixed: Create a proper wrapper function for launch
             async def launch_browser():
-                return await self.playwright.chromium.launch(headless=self.headless)
+                return await playwright.chromium.launch(headless=self.headless)
             
             # Launch browser with retry
             browser = await retry_async(
@@ -149,7 +152,7 @@ class BrowserPool:
                 config=RetryConfig(
                     max_attempts=3,
                     initial_delay=1.0,
-                    exceptions=(Exception,)  # Fixed: Use Exception base class
+                    exceptions=(Exception,)
                 )
             )
             
