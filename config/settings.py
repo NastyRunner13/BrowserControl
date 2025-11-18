@@ -9,6 +9,11 @@ class Settings:
     # API Keys
     GROQ_API_KEY = os.getenv("GROQ_API_KEY")
     
+    # Validation on load
+    if not GROQ_API_KEY or "your_groq_api_key" in GROQ_API_KEY:
+        # Don't raise error on import to allow testing, but warn loudly
+        print("WARNING: GROQ_API_KEY is not set or invalid in .env")
+    
     # Browser Configuration
     MAX_BROWSERS = int(os.getenv("MAX_BROWSERS", "5"))
     HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
