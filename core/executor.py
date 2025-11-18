@@ -51,32 +51,39 @@ class IntelligentParallelExecutor:
             raise ValueError(f"Unknown action: {action}")
     
     async def _intelligent_click(self, page: Page, step: Dict[str, Any], context: str) -> str:
-        """Intelligently find and click an element."""
-        description = step['description']
-        
-        find_result = await self.element_finder.find_element_intelligently(
-            page, description, context
-        )
-        
-        if not find_result['success']:
-            raise Exception(f"Could not find element: {description}")
-        
-        selector = find_result['selector']
-        
-        try:
-            await page.locator(selector).scroll_into_view_if_needed(timeout=5000)
-            await page.wait_for_timeout(500)
-            await page.click(selector, timeout=10000)
-            await page.wait_for_timeout(1000)
+            """Intelligently find and click an element."""
+            description = step['description']
             
-            return f"Clicked '{description}' using {selector}"
+            find_result = await self.element_finder.find_element_intelligently(
+                page, description, context
+            )
             
-        except Exception as e:
+            if not find_result['success']:
+                raise Exception(f"Could not find element: {description}")
+            
+            selector = find_result['selector']
+            
             try:
-                await page.locator(selector).click(force=True, timeout=5000)
-                return f"Force-clicked '{description}'"
-            except:
-                raise Exception(f"Failed to click '{description}': {str(e)}")
+                # 1. Scroll into view
+                locator = page.locator(selector).first # Ensure we get a locator
+                await locator.scroll_into_view_if_needed(timeout=5000)
+                
+                # 2. STABILITY FIX: Scroll back up a tiny bit in case of sticky headers
+                await page.evaluate("window.scrollBy(0, -100)")
+                await asyncio.sleep(0.5) # Short settlement wait
+                
+                # 3. Click
+                await locator.click(timeout=10000)
+                
+                return f"Clicked '{description}' using {selector}"
+                
+            except Exception as e:
+                # Fallback: Force Click (JS click)
+                try:
+                    await page.locator(selector).first.click(force=True, timeout=5000)
+                    return f"Force-clicked '{description}'"
+                except:
+                    raise Exception(f"Failed to click '{description}': {str(e)}")
     
     async def _intelligent_type(self, page: Page, step: Dict[str, Any], context: str) -> str:
         """Intelligently find and type into an element."""
