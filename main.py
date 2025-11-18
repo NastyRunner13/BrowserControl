@@ -1,121 +1,56 @@
 import asyncio
-import json
-from tools.automation_tools import execute_intelligent_parallel_tasks
-from workflows.templates import WorkflowTemplates
+import sys
+import argparse
+from core.planner import AutomationAgent
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
 
-async def demo_ecommerce_search():
-    """Demo: E-commerce product search."""
+async def run_interactive_mode():
+    """Run the agent in an interactive loop."""
+    agent = AutomationAgent()
     print("\n" + "="*60)
-    print("DEMO: E-commerce Product Search")
+    print("🤖 BROWSER AGENT - INTERACTIVE MODE")
+    print("Type 'exit' or 'quit' to stop.")
     print("="*60)
-    
-    task = WorkflowTemplates.create_ecommerce_search(
-        site_url="https://www.amazon.com",
-        product_query="wireless headphones",
-        site_context="Looking for audio products"
-    )
-    
-    result = await execute_intelligent_parallel_tasks.ainvoke({
-        "tasks_json": json.dumps([task.to_dict()]),
-        "headless": False
-    })
-    
-    print(result)
 
-async def demo_price_comparison():
-    """Demo: Price comparison across multiple sites."""
-    print("\n" + "="*60)
-    print("DEMO: Price Comparison")
-    print("="*60)
-    
-    tasks = WorkflowTemplates.create_price_comparison(
-        product_name="laptop",
-        websites=["amazon.com", "bestbuy.com"]
-    )
-    
-    result = await execute_intelligent_parallel_tasks.ainvoke({
-        "tasks_json": json.dumps([task.to_dict() for task in tasks]),
-        "headless": False
-    })
-    
-    print(result)
-
-async def demo_custom_workflow():
-    """Demo: Custom workflow with manual task definition."""
-    print("\n" + "="*60)
-    print("DEMO: Custom Google Search")
-    print("="*60)
-    
-    custom_task = {
-        "task_id": "custom_google_search",
-        "name": "Custom Google Search",
-        "context": "Testing intelligent element finding on Google",
-        "steps": [
-            {"action": "navigate", "url": "https://www.google.com"},
-            {"action": "wait", "seconds": 2},
-            {"action": "intelligent_type", 
-             "description": "search box", 
-             "text": "browser automation python"},
-            {"action": "intelligent_click", 
-             "description": "search button"},
-            {"action": "wait", "seconds": 3},
-            {"action": "screenshot", 
-             "filename": "google_search_results.png"}
-        ]
-    }
-    
-    result = await execute_intelligent_parallel_tasks.ainvoke({
-        "tasks_json": json.dumps([custom_task]),
-        "headless": False
-    })
-    
-    print(result)
-
-async def interactive_mode():
-    """Interactive mode for custom commands."""
-    print("\n" + "="*60)
-    print("INTERACTIVE MODE")
-    print("="*60)
-    print("Available commands:")
-    print("  1 - E-commerce Search Demo")
-    print("  2 - Price Comparison Demo")
-    print("  3 - Custom Google Search")
-    print("  q - Quit")
-    print("="*60)
-    
     while True:
-        choice = input("\nEnter command: ").strip().lower()
-        
-        if choice == 'q':
+        try:
+            user_input = input("\nWhat would you like to do? \n> ").strip()
+            
+            if user_input.lower() in ['exit', 'quit', 'q']:
+                print("Goodbye! 👋")
+                break
+            
+            if not user_input:
+                continue
+                
+            # Decide if headless based on simple heuristic or arg
+            # For interactive mode, seeing the browser is usually better
+            await agent.run(user_input, headless=False)
+            
+        except KeyboardInterrupt:
+            print("\nOperation cancelled by user.")
             break
-        elif choice == '1':
-            await demo_ecommerce_search()
-        elif choice == '2':
-            await demo_price_comparison()
-        elif choice == '3':
-            await demo_custom_workflow()
-        else:
-            print("Invalid command. Try again.")
+        except Exception as e:
+            logger.error(f"Error in interactive loop: {e}")
+            print(f"Error: {e}")
 
 async def main():
     """Main entry point."""
-    print("="*60)
-    print("INTELLIGENT BROWSER AUTOMATION PLATFORM")
-    print("="*60)
+    parser = argparse.ArgumentParser(description="Intelligent Browser Automation Agent")
+    parser.add_argument("task", nargs="?", help="The natural language task to perform")
+    parser.add_argument("--headless", action="store_true", help="Run in headless mode (no UI)")
     
-    # Run demos
-    try:
-        await demo_custom_workflow()
-    except KeyboardInterrupt:
-        print("\nShutdown requested...")
-    except Exception as e:
-        logger.error(f"Error in main: {e}")
-        print(f"Error: {e}")
+    args = parser.parse_args()
     
-    print("\nDone!")
+    if args.task:
+        # One-off command mode
+        agent = AutomationAgent()
+        await agent.run(args.task, headless=args.headless)
+    else:
+        # Interactive mode
+        await run_interactive_mode()
 
 if __name__ == "__main__":
     asyncio.run(main())
