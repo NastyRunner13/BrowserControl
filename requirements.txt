@@ -16,3 +16,6 @@ pytest
 
 # Validation
 pydantic
+
+# Web framework for API exposure
+fastapi
