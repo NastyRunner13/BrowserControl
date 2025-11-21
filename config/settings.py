@@ -6,30 +6,116 @@ load_dotenv()
 class Settings:
     """Application settings and configuration."""
     
-    # API Keys
+    # ==========================================
+    # API KEYS
+    # ==========================================
     GROQ_API_KEY = os.getenv("GROQ_API_KEY")
     
     # Validation on load
     if not GROQ_API_KEY or "your_groq_api_key" in GROQ_API_KEY:
-        # Don't raise error on import to allow testing, but warn loudly
         print("WARNING: GROQ_API_KEY is not set or invalid in .env")
     
-    # Browser Configuration
+    # ==========================================
+    # BROWSER CONFIGURATION
+    # ==========================================
     MAX_BROWSERS = int(os.getenv("MAX_BROWSERS", "5"))
     HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
     BROWSER_TIMEOUT = int(os.getenv("BROWSER_TIMEOUT", "30000"))
     
-    # LLM Configuration
+    # ==========================================
+    # LLM CONFIGURATION
+    # ==========================================
+    # Text-based LLM for planning and reasoning
     LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
     LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.1"))
     
-    # Execution Configuration
+    # Vision LLM for visual element detection
+    VISION_MODEL = os.getenv("VISION_MODEL", "llama-3.2-90b-vision-preview")
+    VISION_ENABLED = os.getenv("VISION_ENABLED", "false").lower() == "true"
+    
+    # ==========================================
+    # EXECUTION CONFIGURATION
+    # ==========================================
     DEFAULT_TASK_TIMEOUT = int(os.getenv("DEFAULT_TASK_TIMEOUT", "300"))
     DEFAULT_RETRY_COUNT = int(os.getenv("DEFAULT_RETRY_COUNT", "3"))
     INTELLIGENCE_RATIO = float(os.getenv("INTELLIGENCE_RATIO", "0.3"))
     
-    # Paths
+    # ==========================================
+    # NEW FEATURES CONFIGURATION
+    # ==========================================
+    
+    # Dynamic Agent Settings
+    ENABLE_DYNAMIC_AGENT = os.getenv("ENABLE_DYNAMIC_AGENT", "true").lower() == "true"
+    MAX_AGENT_STEPS = int(os.getenv("MAX_AGENT_STEPS", "50"))
+    AGENT_HISTORY_LENGTH = int(os.getenv("AGENT_HISTORY_LENGTH", "5"))
+    
+    # Self-Correction Settings
+    ENABLE_SELF_CORRECTION = os.getenv("ENABLE_SELF_CORRECTION", "true").lower() == "true"
+    MAX_CORRECTION_ATTEMPTS = int(os.getenv("MAX_CORRECTION_ATTEMPTS", "2"))
+    
+    # Vision Settings
+    ENABLE_VISION_FALLBACK = os.getenv("ENABLE_VISION_FALLBACK", "true").lower() == "true"
+    VISION_CACHE_ENABLED = os.getenv("VISION_CACHE_ENABLED", "true").lower() == "true"
+    VISION_MAX_MARKERS = int(os.getenv("VISION_MAX_MARKERS", "50"))
+    
+    # Persistent Context Settings (OPTIONAL - use with caution)
+    ENABLE_PERSISTENT_CONTEXT = os.getenv("ENABLE_PERSISTENT_CONTEXT", "false").lower() == "true"
+    STORAGE_STATE_PATH = os.getenv("STORAGE_STATE_PATH", "./storage_state.json")
+    
+    # Cost Control
+    MAX_LLM_CALLS_PER_TASK = int(os.getenv("MAX_LLM_CALLS_PER_TASK", "100"))
+    
+    # ==========================================
+    # PATHS
+    # ==========================================
     SCREENSHOT_DIR = os.getenv("SCREENSHOT_DIR", "./screenshots")
     LOG_DIR = os.getenv("LOG_DIR", "./logs")
+    
+    # ==========================================
+    # FEATURE FLAGS
+    # ==========================================
+    @staticmethod
+    def get_feature_flags() -> dict:
+        """Get current feature flag status."""
+        return {
+            "vision_enabled": Settings.VISION_ENABLED,
+            "dynamic_agent": Settings.ENABLE_DYNAMIC_AGENT,
+            "self_correction": Settings.ENABLE_SELF_CORRECTION,
+            "persistent_context": Settings.ENABLE_PERSISTENT_CONTEXT,
+            "vision_fallback": Settings.ENABLE_VISION_FALLBACK
+        }
+    
+    @staticmethod
+    def validate_configuration():
+        """Validate critical configuration settings."""
+        errors = []
+        
+        # Check API key
+        if not Settings.GROQ_API_KEY:
+            errors.append("GROQ_API_KEY is required")
+        
+        # Check vision model compatibility
+        if Settings.VISION_ENABLED and not Settings.VISION_MODEL:
+            errors.append("VISION_MODEL must be set when VISION_ENABLED=true")
+        
+        # Check agent steps
+        if Settings.MAX_AGENT_STEPS < 1:
+            errors.append("MAX_AGENT_STEPS must be at least 1")
+        
+        # Warn about persistent context security
+        if Settings.ENABLE_PERSISTENT_CONTEXT:
+            print("⚠️  WARNING: Persistent context is enabled. This stores auth tokens on disk.")
+            print("   Only use in trusted environments. Consider using credential managers instead.")
+        
+        if errors:
+            raise ValueError(f"Configuration errors: {', '.join(errors)}")
+        
+        return True
 
 settings = Settings()
+
+# Validate on module load
+try:
+    settings.validate_configuration()
+except ValueError as e:
+    print(f"⚠️  Configuration validation failed: {e}")
