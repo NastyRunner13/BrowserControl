@@ -1,3 +1,4 @@
+import base64
 import difflib
 from typing import Dict, List, Any, Optional
 from playwright.async_api import Page
@@ -10,182 +11,315 @@ from config.settings import settings
 logger = setup_logger(__name__)
 
 class IntelligentElementFinder:
-    """Advanced element finding with AI-powered reasoning and smart filtering."""
+    """
+    Advanced element finding with Vision AI (Set-of-Marks) and fallback strategies.
+    
+    Now implements a 3-tier approach:
+    1. DOM-based AI matching (fast, existing approach)
+    2. Vision AI with visual markers (most reliable, fallback)
+    3. Rule-based fallback (last resort)
+    
+    Backward compatible with existing code - same interface as before,
+    but with enhanced capabilities when vision is enabled.
+    """
     
     def __init__(self, llm=None):
-        # Convert api_key to SecretStr if it exists
         api_key = settings.GROQ_API_KEY
         if api_key is None:
-            raise ValueError("GROQ_API_KEY is not set in environment variables")
+            raise ValueError("GROQ_API_KEY is not set")
         
+        # Main LLM for text-based reasoning
         self.llm = llm or ChatGroq(
             model=settings.LLM_MODEL,
             temperature=settings.LLM_TEMPERATURE,
             api_key=SecretStr(api_key) if isinstance(api_key, str) else api_key
         )
+        
+        # Vision model for multimodal tasks (only if enabled)
+        self.vision_llm = None
+        if settings.VISION_ENABLED or settings.ENABLE_VISION_FALLBACK:
+            try:
+                self.vision_llm = ChatGroq(
+                    model=settings.VISION_MODEL,
+                    temperature=0.1,
+                    api_key=SecretStr(api_key) if isinstance(api_key, str) else api_key
+                )
+                logger.info("Vision model initialized successfully")
+            except Exception as e:
+                logger.warning(f"Failed to initialize vision model: {e}")
+                logger.warning("Vision features will be disabled")
+        
+        self._vision_cache = {}
     
-    async def find_element_intelligently(self, page: Page, description: str, 
-                                       context: str = "") -> Dict[str, Any]:
-        """Find an element using AI-powered analysis with smart filtering."""
+    async def find_element_intelligently(
+        self, 
+        page: Page, 
+        description: str,
+        context: str = ""
+    ) -> Dict[str, Any]:
+        """
+        Find element using multi-tier strategy with vision fallback.
+        
+        Args:
+            page: Playwright page object
+            description: Natural language description of element
+            context: Additional context about the task
+            
+        Returns:
+            Dictionary with success status, element data, and selector
+        """
         try:
-            # Get all interactive elements
+            # Get all interactive elements first
             all_elements = await self._get_interactive_elements(page)
             
             if not all_elements:
+                logger.warning("No interactive elements found on page")
                 return {"success": False, "error": "No interactive elements found"}
             
             logger.info(f"Found {len(all_elements)} total interactive elements")
             
-            # Strategy 1: Try viewport-visible elements first (most common case)
-            viewport_elements = self._filter_by_viewport(all_elements)
-            logger.info(f"Filtered to {len(viewport_elements)} viewport-visible elements")
+            # === TIER 1: DOM-BASED AI MATCHING (Fast) ===
+            logger.debug("Attempting DOM-based element finding...")
             
+            # Try viewport elements first
+            viewport_elements = self._filter_by_viewport(all_elements)
             if viewport_elements:
                 match_result = await self._ai_powered_element_matching(
                     description, viewport_elements, context, strategy="viewport"
                 )
                 if match_result['success']:
-                    logger.info("Found element using viewport strategy")
+                    logger.info("✓ Found element using DOM-based viewport strategy")
                     return match_result
             
-            # Strategy 2: Try relevance-filtered elements (smart pre-filtering)
+            # Try relevance-filtered elements
             relevant_elements = self._filter_by_relevance(all_elements, description)
-            logger.info(f"Filtered to {len(relevant_elements)} relevant elements")
-            
-            if relevant_elements and relevant_elements != viewport_elements:
+            if relevant_elements:
                 match_result = await self._ai_powered_element_matching(
                     description, relevant_elements, context, strategy="relevance"
                 )
                 if match_result['success']:
-                    logger.info("Found element using relevance strategy")
+                    logger.info("✓ Found element using DOM-based relevance strategy")
                     return match_result
             
-            # Strategy 3: Try all elements (up to 200) as last resort
-            logger.info("Trying full element scan as fallback")
-            match_result = await self._ai_powered_element_matching(
-                description, all_elements[:200], context, strategy="full"
-            )
+            # === TIER 2: VISION AI FALLBACK (If enabled) ===
+            if settings.ENABLE_VISION_FALLBACK and self.vision_llm:
+                logger.info("DOM-based finding failed, trying Vision AI fallback...")
+                vision_result = await self._find_with_vision(page, description, context)
+                
+                if vision_result['success']:
+                    logger.info(f"✓ Found element using Vision AI")
+                    return vision_result
+                else:
+                    logger.warning(f"Vision AI also failed: {vision_result.get('error', 'Unknown')}")
             
-            return match_result
+            # === TIER 3: RULE-BASED FALLBACK ===
+            logger.info("Falling back to rule-based matching...")
+            return await self._fallback_element_matching(description, all_elements)
             
         except Exception as e:
-            logger.error(f"Intelligent element finding failed: {e}")
+            logger.error(f"All element finding strategies failed: {e}")
             return {"success": False, "error": str(e)}
     
-    def _filter_by_viewport(self, elements: List[Dict]) -> List[Dict]:
-        """
-        Filter elements that are currently visible in the viewport.
-        
-        Args:
-            elements: List of all elements
-            
-        Returns:
-            List of viewport-visible elements
-        """
-        viewport_elements = []
-        
-        for elem in elements:
-            pos = elem.get('position', {})
-            y = pos.get('y', 0)
-            height = pos.get('height', 0)
-            
-            # Consider elements within reasonable viewport range
-            # Typical viewport height is 600-1080px
-            # Include elements slightly below fold for scrolling scenarios
-            if y >= 0 and y < 1500 and height > 0:
-                viewport_elements.append(elem)
-        
-        return viewport_elements
+    # ========================================
+    # VISION AI METHODS (NEW)
+    # ========================================
     
-    def _filter_by_relevance(self, elements: List[Dict], description: str) -> List[Dict]:
+    async def _find_with_vision(
+        self, 
+        page: Page, 
+        description: str, 
+        context: str
+    ) -> Dict[str, Any]:
         """
-        Smart pre-filter elements based on description relevance.
-        Keeps elements that are likely matches based on keywords.
+        Use Vision AI with Set-of-Marks to find elements.
         
-        Args:
-            elements: List of all elements
-            description: User's description of target element
-            
-        Returns:
-            List of potentially relevant elements (max 150)
+        Process:
+        1. Inject numbered red boxes over interactive elements
+        2. Take screenshot with markers
+        3. Send to vision LLM with description
+        4. Parse response to get element ID
         """
-        description_lower = description.lower()
-        description_words = set(description_lower.split())
-        
-        # Extract keywords from description
-        action_keywords = {'button', 'link', 'input', 'field', 'box', 'dropdown', 'select', 'menu'}
-        position_keywords = {'top', 'bottom', 'left', 'right', 'main', 'sidebar', 'header', 'footer'}
-        
-        action_hints = action_keywords & description_words
-        position_hints = position_keywords & description_words
-        
-        scored_elements = []
-        
-        for elem in elements:
-            relevance_score = 0
+        try:
+            # Inject visual markers and get element map
+            logger.debug("Injecting visual markers...")
+            element_map = await self._inject_visual_markers(page)
             
-            # Score based on text content
-            text = elem.get('text', '').lower()
-            if text:
-                # Exact phrase match
-                if description_lower in text:
-                    relevance_score += 50
-                # Word overlap
-                text_words = set(text.split())
-                overlap = len(description_words & text_words)
-                relevance_score += overlap * 10
+            if not element_map:
+                return {"success": False, "error": "No markable elements found"}
             
-            # Score based on placeholder/aria-label
-            placeholder = elem.get('placeholder', '').lower()
-            aria_label = elem.get('ariaLabel', '').lower()
+            logger.info(f"Marked {len(element_map)} elements for vision analysis")
             
-            if description_lower in placeholder:
-                relevance_score += 40
-            if description_lower in aria_label:
-                relevance_score += 40
+            # Take screenshot with markers visible
+            screenshot_bytes = await page.screenshot(full_page=False)
+            screenshot_b64 = base64.b64encode(screenshot_bytes).decode('utf-8')
             
-            # Score based on element type matching description
-            tag_name = elem.get('tagName', '')
-            elem_type = elem.get('type', '')
+            # Build vision prompt
+            vision_prompt = f"""You are analyzing a webpage screenshot with numbered RED BOXES over interactive elements.
+
+USER WANTS TO: "{description}"
+{f"CONTEXT: {context}" if context else ""}
+
+The red numbers correspond to these elements:
+{self._format_element_map(element_map)}
+
+TASK: Which numbered element best matches what the user wants to interact with?
+
+Respond with ONLY the number (e.g., "5") or -1 if no good match exists."""
+
+            if not self.vision_llm:
+                return {"success": False, "error": "Vision model not available"}
             
-            if action_hints:
-                if 'button' in action_hints and tag_name == 'button':
-                    relevance_score += 20
-                if 'link' in action_hints and tag_name == 'a':
-                    relevance_score += 20
-                if 'input' in action_hints and tag_name == 'input':
-                    relevance_score += 20
-                if 'field' in action_hints and tag_name in ['input', 'textarea']:
-                    relevance_score += 20
+            # Send to vision model
+            message_content = [
+                {"type": "text", "text": vision_prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"}
+                }
+            ]
+
+            response = await self.vision_llm.ainvoke([{
+                "role": "user",
+                "content": message_content
+            }])
             
-            # Score based on position hints
-            y_pos = elem.get('position', {}).get('y', 0)
-            if position_hints:
-                if 'top' in position_hints and y_pos < 200:
-                    relevance_score += 15
-                if 'bottom' in position_hints and y_pos > 600:
-                    relevance_score += 15
-                if 'header' in position_hints and y_pos < 150:
-                    relevance_score += 15
-                if 'footer' in position_hints and y_pos > 800:
-                    relevance_score += 15
+            # Parse response
+            response_text = response.content if isinstance(response.content, str) else str(response.content)
+            element_id = extract_number(response_text)
             
-            # Always include elements with any relevance
-            if relevance_score > 0:
-                scored_elements.append((relevance_score, elem))
+            # Clean up markers
+            await self._remove_visual_markers(page)
+            
+            if element_id is not None and element_id in element_map:
+                selected = element_map[element_id]
+                logger.info(f"Vision AI selected element {element_id}")
+                
+                return {
+                    "success": True,
+                    "element": selected,
+                    "selector": selected['selector'],
+                    "confidence": "high",
+                    "reasoning": f"Vision AI identified element {element_id}",
+                    "method": "vision_ai"
+                }
+            
+            return {"success": False, "error": f"Vision AI returned invalid ID: {element_id}"}
+            
+        except Exception as e:
+            logger.error(f"Vision-based finding failed: {e}")
+            # Clean up markers in case of error
+            try:
+                await self._remove_visual_markers(page)
+            except:
+                pass
+            return {"success": False, "error": f"Vision AI error: {str(e)}"}
+    
+    async def _inject_visual_markers(self, page: Page) -> Dict[int, Dict[str, Any]]:
+        """Inject numbered visual markers over interactive elements."""
+        element_map = await page.evaluate("""
+            () => {
+                const map = {};
+                const selectors = [
+                    'button', 'a[href]', 'input', 'textarea', 'select',
+                    '[role="button"]', '[onclick]', '[tabindex]'
+                ];
+                
+                const elements = new Set();
+                selectors.forEach(sel => {
+                    document.querySelectorAll(sel).forEach(el => elements.add(el));
+                });
+                
+                let index = 0;
+                elements.forEach(el => {
+                    const rect = el.getBoundingClientRect();
+                    const isVisible = rect.width > 0 && rect.height > 0 &&
+                                    window.getComputedStyle(el).visibility !== 'hidden';
+                    
+                    // Only mark elements in viewport
+                    if (isVisible && rect.top < window.innerHeight && rect.left < window.innerWidth) {
+                        // Create marker overlay
+                        const marker = document.createElement('div');
+                        marker.className = 'som-marker';
+                        marker.style.cssText = `
+                            position: fixed;
+                            left: ${rect.left}px;
+                            top: ${rect.top}px;
+                            width: ${rect.width}px;
+                            height: ${rect.height}px;
+                            background: rgba(255, 0, 0, 0.3);
+                            border: 2px solid red;
+                            color: white;
+                            font-weight: bold;
+                            font-size: 16px;
+                            z-index: 999999;
+                            pointer-events: none;
+                            display: flex;
+                            align-items: center;
+                            justify-content: center;
+                        `;
+                        marker.textContent = index;
+                        document.body.appendChild(marker);
+                        
+                        // Generate selector
+                        let selector = '';
+                        if (el.id) {
+                            selector = `#${el.id}`;
+                        } else if (el.name) {
+                            selector = `[name="${el.name}"]`;
+                        } else {
+                            const tagName = el.tagName.toLowerCase();
+                            const siblings = Array.from(el.parentNode?.children || [])
+                                .filter(sib => sib.tagName === el.tagName);
+                            const position = siblings.indexOf(el) + 1;
+                            selector = `${tagName}:nth-child(${position})`;
+                        }
+                        
+                        // Store element data
+                        map[index] = {
+                            tagName: el.tagName.toLowerCase(),
+                            text: el.textContent?.trim().substring(0, 50) || '',
+                            type: el.type || '',
+                            placeholder: el.placeholder || '',
+                            ariaLabel: el.getAttribute('aria-label') || '',
+                            id: el.id || '',
+                            selector: selector
+                        };
+                        
+                        index++;
+                    }
+                });
+                
+                return map;
+            }
+        """)
         
-        # If no relevance matches, return all elements (let AI decide)
-        if not scored_elements:
-            logger.warning("No relevant elements found by pre-filter, using all elements")
-            return elements[:150]
+        return element_map
+    
+    async def _remove_visual_markers(self, page: Page):
+        """Remove injected visual markers."""
+        await page.evaluate("() => { document.querySelectorAll('.som-marker').forEach(el => el.remove()); }")
+    
+    def _format_element_map(self, element_map: Dict[int, Dict]) -> str:
+        """Format element map for vision prompt."""
+        lines = []
+        max_elements = min(len(element_map), settings.VISION_MAX_MARKERS)
         
-        # Sort by relevance score and return top 150
-        scored_elements.sort(key=lambda x: x[0], reverse=True)
-        relevant = [elem for score, elem in scored_elements[:150]]
+        for idx in sorted(element_map.keys())[:max_elements]:
+            elem = element_map[idx]
+            desc = f"[{idx}] {elem['tagName'].upper()}"
+            if elem['text']:
+                desc += f" '{elem['text'][:30]}'"
+            elif elem['placeholder']:
+                desc += f" (placeholder: '{elem['placeholder']}')"
+            elif elem['ariaLabel']:
+                desc += f" (aria: '{elem['ariaLabel']}')"
+            lines.append(desc)
         
-        logger.info(f"Relevance filter: Top score={scored_elements[0][0]}, kept {len(relevant)} elements")
-        
-        return relevant
+        return "\n".join(lines)
+    
+    # ========================================
+    # DOM-BASED METHODS (EXISTING)
+    # ========================================
     
     async def _get_interactive_elements(self, page: Page) -> List[Dict]:
         """Extract and analyze interactive elements from the page."""
@@ -217,6 +351,24 @@ class IntelligentElementFinder:
                                 const text = el.textContent || el.innerText || '';
                                 const cleanText = text.trim().replace(/\\s+/g, ' ');
                                 
+                                function generateBestSelector(element) {
+                                    if (element.id) return `#${element.id}`;
+                                    if (element.name) return `[name="${element.name}"]`;
+                                    
+                                    const ariaLabel = element.getAttribute('aria-label');
+                                    if (ariaLabel) return `[aria-label="${ariaLabel}"]`;
+                                    
+                                    const tagName = element.tagName.toLowerCase();
+                                    const parent = element.parentNode;
+                                    if (parent) {
+                                        const siblings = Array.from(parent.children)
+                                            .filter(sib => sib.tagName === element.tagName);
+                                        const index = siblings.indexOf(element) + 1;
+                                        return `${tagName}:nth-child(${index})`;
+                                    }
+                                    return tagName;
+                                }
+                                
                                 elements.push({
                                     tagName: el.tagName.toLowerCase(),
                                     text: cleanText.substring(0, 100),
@@ -242,58 +394,6 @@ class IntelligentElementFinder:
                     });
                 });
                 
-                function generateBestSelector(element) {
-                    if (element.id) return `#${element.id}`;
-                    if (element.name) return `[name="${element.name}"]`;
-                    
-                    if (element.className && typeof element.className === 'string') {
-                        const classes = element.className.trim().split(/\\s+/);
-                        for (const cls of classes) {
-                            if (cls && document.querySelectorAll(`.${CSS.escape(cls)}`).length === 1) {
-                                return `.${CSS.escape(cls)}`;
-                            }
-                        }
-                    }
-                    
-                    const ariaLabel = element.getAttribute('aria-label');
-                    if (ariaLabel) {
-                        return `[aria-label="${ariaLabel}"]`;
-                    }
-                    
-                    const path = [];
-                    let current = element;
-                    
-                    while (current && current !== document.body) {
-                        let selector = current.tagName.toLowerCase();
-                        
-                        if (current.id) {
-                            selector += `#${current.id}`;
-                            path.unshift(selector);
-                            break;
-                        }
-                        
-                        if (current.className && typeof current.className === 'string') {
-                            const classes = current.className.trim().split(/\\s+/);
-                            if (classes.length > 0 && classes[0]) {
-                                selector += `.${CSS.escape(classes[0])}`;
-                            }
-                        }
-                        
-                        const siblings = Array.from(current.parentNode?.children || [])
-                            .filter(sibling => sibling.tagName === current.tagName);
-                        
-                        if (siblings.length > 1) {
-                            const index = siblings.indexOf(current) + 1;
-                            selector += `:nth-child(${index})`;
-                        }
-                        
-                        path.unshift(selector);
-                        current = current.parentElement;
-                    }
-                    
-                    return path.join(' > ');
-                }
-                
                 return elements.sort((a, b) => {
                     if (Math.abs(a.position.y - b.position.y) > 50) {
                         return a.position.y - b.position.y;
@@ -305,19 +405,86 @@ class IntelligentElementFinder:
         
         return elements_data
     
-    async def _ai_powered_element_matching(self, description: str, elements: List[Dict], 
-                                         context: str = "", strategy: str = "viewport") -> Dict[str, Any]:
-        """
-        Use AI to intelligently match description to page elements.
+    def _filter_by_viewport(self, elements: List[Dict]) -> List[Dict]:
+        """Filter elements that are currently visible in the viewport."""
+        viewport_elements = []
+        for elem in elements:
+            pos = elem.get('position', {})
+            y = pos.get('y', 0)
+            height = pos.get('height', 0)
+            if y >= 0 and y < 1500 and height > 0:
+                viewport_elements.append(elem)
+        return viewport_elements
+    
+    def _filter_by_relevance(self, elements: List[Dict], description: str) -> List[Dict]:
+        """Smart pre-filter elements based on description relevance."""
+        description_lower = description.lower()
+        description_words = set(description_lower.split())
         
-        Args:
-            description: User's description of target element
-            elements: Filtered list of elements to consider
-            context: Additional context about the task
-            strategy: Which filtering strategy was used
-        """
+        action_keywords = {'button', 'link', 'input', 'field', 'box', 'dropdown', 'select', 'menu'}
+        position_keywords = {'top', 'bottom', 'left', 'right', 'main', 'sidebar', 'header', 'footer'}
         
-        # Limit to top 100 elements for AI analysis (token limit consideration)
+        action_hints = action_keywords & description_words
+        position_hints = position_keywords & description_words
+        
+        scored_elements = []
+        
+        for elem in elements:
+            relevance_score = 0
+            
+            # Score based on text content
+            text = elem.get('text', '').lower()
+            if text:
+                if description_lower in text:
+                    relevance_score += 50
+                text_words = set(text.split())
+                overlap = len(description_words & text_words)
+                relevance_score += overlap * 10
+            
+            # Score based on placeholder/aria-label
+            placeholder = elem.get('placeholder', '').lower()
+            aria_label = elem.get('ariaLabel', '').lower()
+            
+            if description_lower in placeholder:
+                relevance_score += 40
+            if description_lower in aria_label:
+                relevance_score += 40
+            
+            # Score based on element type
+            tag_name = elem.get('tagName', '')
+            if action_hints:
+                if 'button' in action_hints and tag_name == 'button':
+                    relevance_score += 20
+                if 'link' in action_hints and tag_name == 'a':
+                    relevance_score += 20
+                if 'input' in action_hints and tag_name == 'input':
+                    relevance_score += 20
+            
+            # Score based on position
+            y_pos = elem.get('position', {}).get('y', 0)
+            if position_hints:
+                if 'top' in position_hints and y_pos < 200:
+                    relevance_score += 15
+                if 'bottom' in position_hints and y_pos > 600:
+                    relevance_score += 15
+            
+            if relevance_score > 0:
+                scored_elements.append((relevance_score, elem))
+        
+        if not scored_elements:
+            return elements[:150]
+        
+        scored_elements.sort(key=lambda x: x[0], reverse=True)
+        return [elem for score, elem in scored_elements[:150]]
+    
+    async def _ai_powered_element_matching(
+        self, 
+        description: str, 
+        elements: List[Dict],
+        context: str = "",
+        strategy: str = "viewport"
+    ) -> Dict[str, Any]:
+        """Use AI to intelligently match description to page elements."""
         elements_to_analyze = elements[:100]
         
         element_summaries = []
@@ -359,7 +526,7 @@ Respond with ONLY the number (0-{len(element_summaries)-1}) of the best match, o
         try:
             response = await self.llm.ainvoke([{"role": "user", "content": prompt}])
             
-            # Handle response content which can be a string or a list of content blocks
+            # Handle response content
             if isinstance(response.content, str):
                 response_text = response.content.strip()
             elif isinstance(response.content, list):
@@ -442,7 +609,7 @@ Respond with ONLY the number (0-{len(element_summaries)-1}) of the best match, o
                     score += 15
                     reasons.append("type match")
             
-            # Position bonus for common patterns
+            # Position bonus
             y_pos = elem['position']['y']
             if 'top' in description_lower and y_pos < 200:
                 score += 10
