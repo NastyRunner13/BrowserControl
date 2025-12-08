@@ -1,4 +1,5 @@
 import base64
+import asyncio
 import difflib
 from typing import Dict, List, Any, Optional
 from playwright.async_api import Page
@@ -101,8 +102,9 @@ class IntelligentElementFinder:
                     logger.info("✓ Found element using DOM-based relevance strategy")
                     return match_result
             
-            # === TIER 2: VISION AI FALLBACK (If enabled) ===
-            if settings.ENABLE_VISION_FALLBACK and self.vision_llm:
+            # === TIER 2: VISION AI FALLBACK (If enabled and available) ===
+            # FIX: Check both setting and if vision_llm exists
+            if settings.ENABLE_VISION_FALLBACK and self.vision_llm is not None:
                 logger.info("DOM-based finding failed, trying Vision AI fallback...")
                 vision_result = await self._find_with_vision(page, description, context)
                 
@@ -111,6 +113,8 @@ class IntelligentElementFinder:
                     return vision_result
                 else:
                     logger.warning(f"Vision AI also failed: {vision_result.get('error', 'Unknown')}")
+            elif settings.ENABLE_VISION_FALLBACK and self.vision_llm is None:
+                logger.warning("Vision fallback enabled but vision_llm not initialized")
             
             # === TIER 3: RULE-BASED FALLBACK ===
             logger.info("Falling back to rule-based matching...")
@@ -139,6 +143,14 @@ class IntelligentElementFinder:
         3. Send to vision LLM with description
         4. Parse response to get element ID
         """
+        # FIX: Check if vision_llm is available before proceeding
+        if self.vision_llm is None:
+            logger.error("Vision LLM not initialized - cannot use vision-based finding")
+            return {
+                "success": False, 
+                "error": "Vision model not available. Check VISION_MODEL configuration."
+            }
+        
         try:
             # Inject visual markers and get element map
             logger.debug("Injecting visual markers...")
@@ -156,31 +168,26 @@ class IntelligentElementFinder:
             # Build vision prompt
             vision_prompt = f"""You are analyzing a webpage screenshot with numbered RED BOXES over interactive elements.
 
-USER WANTS TO: "{description}"
-{f"CONTEXT: {context}" if context else ""}
+    USER WANTS TO: "{description}"
+    {f"CONTEXT: {context}" if context else ""}
 
-The red numbers correspond to these elements:
-{self._format_element_map(element_map)}
+    The red numbers correspond to these elements:
+    {self._format_element_map(element_map)}
 
-TASK: Which numbered element best matches what the user wants to interact with?
+    TASK: Which numbered element best matches what the user wants to interact with?
 
-Respond with ONLY the number (e.g., "5") or -1 if no good match exists."""
+    Respond with ONLY the number (e.g., "5") or -1 if no good match exists."""
 
-            if not self.vision_llm:
-                return {"success": False, "error": "Vision model not available"}
-            
-            # Send to vision model
-            message_content = [
-                {"type": "text", "text": vision_prompt},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"}
-                }
-            ]
-
+            # FIX: Now safe to call ainvoke since we checked above
             response = await self.vision_llm.ainvoke([{
                 "role": "user",
-                "content": message_content
+                "content": [
+                    {"type": "text", "text": vision_prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"}
+                    }
+                ]
             }])
             
             # Parse response
