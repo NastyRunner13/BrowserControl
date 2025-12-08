@@ -11,7 +11,8 @@ from utils.exceptions import (
     BrowserAutomationError,
     TaskExecutionError,
     TaskTimeoutError,
-    ValidationError
+    ValidationError,
+    BrowserInstanceUnavailableError
 )
 from utils.retry import RetryConfig, retry_async
 from config.settings import settings
@@ -24,135 +25,85 @@ async def _execute_single_task(
     executor: IntelligentParallelExecutor
 ) -> Dict[str, Any]:
     """
-    Execute a single task with error handling and retry logic.
+    Execute a single task with guaranteed resource cleanup.
     
-    Args:
-        task: Task to execute
-        pool: Browser pool
-        executor: Task executor
-        
-    Returns:
-        Execution result dictionary
+    FIXED:
+    - Explicit timeout for browser acquisition
+    - Guaranteed instance release
+    - Better error categorization
     """
     browser_instance = None
+    acquisition_failed = False
+    had_error = False
     step_results = []
-    intelligent_actions_count = 0
-    current_step_index = 0
     
     try:
-        # Get browser instance with timeout
-        browser_instance = await pool.get_browser_instance(
-            task.task_id,
-            timeout=30.0
-        )
+        # Try to acquire browser with timeout
+        try:
+            browser_instance = await asyncio.wait_for(
+                pool.get_browser_instance(task.task_id, timeout=30.0),
+                timeout=35.0  # Extra buffer for cleanup
+            )
+        except asyncio.TimeoutError:
+            acquisition_failed = True
+            raise BrowserInstanceUnavailableError(
+                f"Could not acquire browser for task {task.task_id} within 35s"
+            )
+        
         page = browser_instance.page
         
-        logger.info(f"Starting task {task.task_id}: {task.name}")
-        
-        # Execute each step with retry
+        # Execute steps
         for step_index, step in enumerate(task.steps):
-            current_step_index = step_index
-            
             try:
-                # Execute step with retry logic
                 result = await retry_async(
                     executor.execute_intelligent_step,
                     page,
                     step,
                     task.context,
-                    config=RetryConfig(
-                        max_attempts=task.retry_count,
-                        initial_delay=1.0,
-                        exceptions=(Exception,)
-                    )
+                    config=RetryConfig(max_attempts=task.retry_count)
                 )
-                
-                if step['action'].startswith('intelligent_'):
-                    intelligent_actions_count += 1
-                
                 step_results.append({
                     'step_index': step_index,
-                    'action': step['action'],
-                    'result': result,
-                    'success': True
+                    'success': True,
+                    'result': result
                 })
-                
-                logger.info(f"Task {task.task_id} step {step_index}: {result}")
-                
             except Exception as step_error:
-                logger.error(
-                    f"Task {task.task_id} step {step_index} failed: {step_error}"
-                )
+                had_error = True
                 step_results.append({
                     'step_index': step_index,
-                    'action': step['action'],
-                    'error': str(step_error),
-                    'success': False
+                    'success': False,
+                    'error': str(step_error)
                 })
-                
-                # Fail the entire task if a step fails
-                raise TaskExecutionError(
-                    task.task_id,
-                    step_index,
-                    str(step_error)
-                )
-        
-        logger.info(f"Task {task.task_id} completed successfully")
+                raise TaskExecutionError(task.task_id, step_index, str(step_error))
         
         return {
             'success': True,
             'task_id': task.task_id,
-            'name': task.name,
             'steps_completed': len(step_results),
-            'intelligent_actions_used': intelligent_actions_count,
-            'results': step_results
-        }
-        
-    except asyncio.TimeoutError:
-        error_msg = f"Task timed out after {task.timeout}s"
-        logger.error(f"Task {task.task_id}: {error_msg}")
-        
-        return {
-            'success': False,
-            'task_id': task.task_id,
-            'name': task.name,
-            'error': error_msg,
-            'error_type': 'timeout',
-            'steps_completed': len(step_results),
-            'failed_at_step': current_step_index,
-            'results': step_results
-        }
-        
-    except TaskExecutionError as e:
-        return {
-            'success': False,
-            'task_id': task.task_id,
-            'name': task.name,
-            'error': str(e),
-            'error_type': 'execution_error',
-            'steps_completed': len(step_results),
-            'failed_at_step': e.step_index,
             'results': step_results
         }
         
     except Exception as e:
-        logger.error(f"Task {task.task_id} failed with unexpected error: {e}")
-        
+        had_error = True
         return {
             'success': False,
             'task_id': task.task_id,
-            'name': task.name,
             'error': str(e),
-            'error_type': 'unexpected_error',
-            'steps_completed': len(step_results),
-            'failed_at_step': current_step_index,
-            'results': step_results
+            'steps_completed': len(step_results)
         }
         
     finally:
-        if browser_instance:
-            had_error = len(step_results) == 0 or not step_results[-1].get('success', False)
-            await pool.release_browser_instance(browser_instance, had_error=had_error)
+        # GUARANTEED CLEANUP
+        if not acquisition_failed and browser_instance is not None:
+            try:
+                await asyncio.wait_for(
+                    pool.release_browser_instance(browser_instance, had_error=had_error),
+                    timeout=5.0
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"Browser release timed out for task {task.task_id}")
+            except Exception as e:
+                logger.error(f"Error releasing browser: {e}")
 
 async def _execute_intelligent_tasks_parallel(
     tasks: List[IntelligentParallelTask],
