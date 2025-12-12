@@ -25,85 +25,158 @@ async def _execute_single_task(
     executor: IntelligentParallelExecutor
 ) -> Dict[str, Any]:
     """
-    Execute a single task with guaranteed resource cleanup.
+    Execute a single task with GUARANTEED resource cleanup.
     
     FIXED:
+    - Browser instances always released, even on early failures
     - Explicit timeout for browser acquisition
-    - Guaranteed instance release
     - Better error categorization
+    - Prevents resource leaks
     """
     browser_instance = None
     acquisition_failed = False
     had_error = False
     step_results = []
+    current_step_index = 0
     
     try:
-        # Try to acquire browser with timeout
+        # Try to acquire browser with explicit timeout
+        logger.info(f"Acquiring browser for task {task.task_id}")
         try:
             browser_instance = await asyncio.wait_for(
                 pool.get_browser_instance(task.task_id, timeout=30.0),
-                timeout=35.0  # Extra buffer for cleanup
+                timeout=35.0  # Extra 5s buffer for cleanup
             )
+            logger.info(f"Browser acquired for task {task.task_id}")
         except asyncio.TimeoutError:
             acquisition_failed = True
             raise BrowserInstanceUnavailableError(
-                f"Could not acquire browser for task {task.task_id} within 35s"
+                f"Could not acquire browser for task {task.task_id} within 35s. "
+                f"Current pool stats: {pool.get_stats()}"
             )
         
         page = browser_instance.page
+        logger.info(f"Starting task {task.task_id}: {task.name}")
         
-        # Execute steps
+        # Execute each step with retry
         for step_index, step in enumerate(task.steps):
+            current_step_index = step_index
+            
             try:
                 result = await retry_async(
                     executor.execute_intelligent_step,
                     page,
                     step,
                     task.context,
-                    config=RetryConfig(max_attempts=task.retry_count)
+                    config=RetryConfig(
+                        max_attempts=task.retry_count,
+                        initial_delay=1.0,
+                        exceptions=(Exception,)
+                    )
                 )
+                
                 step_results.append({
                     'step_index': step_index,
-                    'success': True,
-                    'result': result
+                    'action': step['action'],
+                    'result': result,
+                    'success': True
                 })
+                
+                logger.info(f"Task {task.task_id} step {step_index} completed: {result[:100] if len(result) > 100 else result}")
+                
             except Exception as step_error:
                 had_error = True
+                logger.error(f"Task {task.task_id} step {step_index} failed: {step_error}")
                 step_results.append({
                     'step_index': step_index,
-                    'success': False,
-                    'error': str(step_error)
+                    'action': step['action'],
+                    'error': str(step_error),
+                    'success': False
                 })
-                raise TaskExecutionError(task.task_id, step_index, str(step_error))
+                
+                # Fail the entire task if a step fails
+                raise TaskExecutionError(
+                    task.task_id,
+                    step_index,
+                    str(step_error)
+                )
+        
+        logger.info(f"Task {task.task_id} completed successfully")
         
         return {
             'success': True,
             'task_id': task.task_id,
+            'name': task.name,
             'steps_completed': len(step_results),
             'results': step_results
         }
         
-    except Exception as e:
-        had_error = True
+    except asyncio.TimeoutError:
+        error_msg = f"Task timed out after {task.timeout}s"
+        logger.error(f"Task {task.task_id}: {error_msg}")
+        
         return {
             'success': False,
             'task_id': task.task_id,
+            'name': task.name,
+            'error': error_msg,
+            'error_type': 'timeout',
+            'steps_completed': len(step_results),
+            'failed_at_step': current_step_index,
+            'results': step_results
+        }
+        
+    except TaskExecutionError as e:
+        return {
+            'success': False,
+            'task_id': task.task_id,
+            'name': task.name,
             'error': str(e),
-            'steps_completed': len(step_results)
+            'error_type': 'execution_error',
+            'steps_completed': len(step_results),
+            'failed_at_step': e.step_index,
+            'results': step_results
+        }
+        
+    except BrowserInstanceUnavailableError as e:
+        return {
+            'success': False,
+            'task_id': task.task_id,
+            'name': task.name,
+            'error': str(e),
+            'error_type': 'browser_unavailable',
+            'steps_completed': 0,
+            'results': []
+        }
+        
+    except Exception as e:
+        logger.error(f"Task {task.task_id} failed with unexpected error: {e}")
+        
+        return {
+            'success': False,
+            'task_id': task.task_id,
+            'name': task.name,
+            'error': str(e),
+            'error_type': 'unexpected_error',
+            'steps_completed': len(step_results),
+            'failed_at_step': current_step_index,
+            'results': step_results
         }
         
     finally:
-        # GUARANTEED CLEANUP
+        # GUARANTEED CLEANUP - This always runs
         if not acquisition_failed and browser_instance is not None:
             try:
+                logger.info(f"Releasing browser for task {task.task_id}")
                 await asyncio.wait_for(
                     pool.release_browser_instance(browser_instance, had_error=had_error),
                     timeout=5.0
                 )
+                logger.info(f"Browser released for task {task.task_id}")
             except asyncio.TimeoutError:
                 logger.error(f"Browser release timed out for task {task.task_id}")
-            except Exception as e:
-                logger.error(f"Error releasing browser: {e}")
+            except Exception as cleanup_error:
+                logger.error(f"Error releasing browser for task {task.task_id}: {cleanup_error}")
 
 async def _execute_intelligent_tasks_parallel(
     tasks: List[IntelligentParallelTask],
