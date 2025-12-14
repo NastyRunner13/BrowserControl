@@ -2,23 +2,22 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from api.routes import router
+from api.manager import job_manager
 from core.browser_pool import BrowserPool
 from config.settings import settings
 from utils.logger import setup_logger
 
 logger = setup_logger("api_server")
 
-@asynccontextmanager
+asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Lifecycle manager for the API.
-    Initializes BrowserPool on startup and cleans up on shutdown.
+    Lifecycle manager for the API with job cleanup.
     """
     # STARTUP
     logger.info("🚀 Starting BrowserControl API...")
     
-    # Initialize the global browser pool
-    # We use the settings from .env
+    # Initialize browser pool
     pool = BrowserPool(
         max_browsers=settings.MAX_BROWSERS,
         headless=settings.HEADLESS
@@ -26,15 +25,23 @@ async def lifespan(app: FastAPI):
     
     try:
         await pool.initialize()
-        # Store pool in app state to be accessed by routes
         app.state.browser_pool = pool
         logger.info("✅ Browser Pool initialized and ready.")
         
-        yield # Application runs here
+        # NEW: Start job cleanup loop
+        await job_manager.start_cleanup_loop()
+        logger.info("✅ Job cleanup loop started")
+        
+        yield  # Application runs here
         
     finally:
         # SHUTDOWN
         logger.info("🛑 Shutting down BrowserControl API...")
+        
+        # NEW: Stop cleanup loop first
+        await job_manager.stop_cleanup_loop()
+        logger.info("✅ Job cleanup loop stopped")
+        
         await pool.cleanup()
         logger.info("✅ Browser Pool cleaned up.")
 
