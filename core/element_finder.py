@@ -137,28 +137,23 @@ class IntelligentElementFinder:
         """
         Use Vision AI with Set-of-Marks to find elements.
         
-        Process:
-        1. Inject numbered red boxes over interactive elements
-        2. Take screenshot with markers
-        3. Send to vision LLM with description
-        4. Parse response to get element ID
+        FIXED: Guaranteed marker cleanup even on exception
         """
-        # FIX: Check if vision_llm is available before proceeding
         if self.vision_llm is None:
-            logger.error("Vision LLM not initialized - cannot use vision-based finding")
-            return {
-                "success": False, 
-                "error": "Vision model not available. Check VISION_MODEL configuration."
-            }
+            logger.error("Vision LLM not initialized")
+            return {"success": False, "error": "Vision model not available"}
+        
+        markers_injected = False
         
         try:
-            # Inject visual markers and get element map
+            # Inject visual markers
             logger.debug("Injecting visual markers...")
             element_map = await self._inject_visual_markers(page)
             
             if not element_map:
                 return {"success": False, "error": "No markable elements found"}
             
+            markers_injected = True
             logger.info(f"Marked {len(element_map)} elements for vision analysis")
             
             # Take screenshot with markers visible
@@ -178,7 +173,7 @@ class IntelligentElementFinder:
 
     Respond with ONLY the number (e.g., "5") or -1 if no good match exists."""
 
-            # FIX: Now safe to call ainvoke since we checked above
+            # Send to vision model
             response = await self.vision_llm.ainvoke([{
                 "role": "user",
                 "content": [
@@ -193,9 +188,6 @@ class IntelligentElementFinder:
             # Parse response
             response_text = response.content if isinstance(response.content, str) else str(response.content)
             element_id = extract_number(response_text)
-            
-            # Clean up markers
-            await self._remove_visual_markers(page)
             
             if element_id is not None and element_id in element_map:
                 selected = element_map[element_id]
@@ -214,12 +206,21 @@ class IntelligentElementFinder:
             
         except Exception as e:
             logger.error(f"Vision-based finding failed: {e}")
-            # Clean up markers in case of error
-            try:
-                await self._remove_visual_markers(page)
-            except:
-                pass
             return {"success": False, "error": f"Vision AI error: {str(e)}"}
+            
+        finally:
+            # GUARANTEED MARKER CLEANUP
+            if markers_injected:
+                try:
+                    await asyncio.wait_for(
+                        self._remove_visual_markers(page),
+                        timeout=2.0
+                    )
+                    logger.debug("Vision markers cleaned up successfully")
+                except asyncio.TimeoutError:
+                    logger.warning("Marker cleanup timed out - page may have stale markers")
+                except Exception as cleanup_error:
+                    logger.warning(f"Failed to clean markers: {cleanup_error}")
     
     async def _inject_visual_markers(self, page: Page) -> Dict[int, Dict[str, Any]]:
         """Inject numbered visual markers over interactive elements."""
