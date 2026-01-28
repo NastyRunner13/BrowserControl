@@ -54,10 +54,11 @@ class TaskExecutionError(BrowserAutomationError):
 class TaskTimeoutError(TaskExecutionError):
     """Task execution timed out."""
     def __init__(self, task_id: str, timeout: int):
-        self.task_id = task_id
         self.timeout = timeout
-        super(BrowserAutomationError, self).__init__(
-            f"Task {task_id} timed out after {timeout}s"
+        super().__init__(
+            task_id=task_id,
+            step_index=-1,
+            reason=f"Task timed out after {timeout}s"
         )
 
 class AIServiceError(BrowserAutomationError):
