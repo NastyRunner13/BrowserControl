@@ -67,6 +67,21 @@ class Settings:
     MAX_LLM_CALLS_PER_TASK = int(os.getenv("MAX_LLM_CALLS_PER_TASK", "100"))
     
     # ==========================================
+    # SECURITY CONFIGURATION
+    # ==========================================
+    # CORS - comma-separated list of allowed origins (use * for all, not recommended for production)
+    ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+    
+    # Rate Limiting (requests per minute per IP)
+    RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
+    RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "60"))
+    RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+    
+    # Prompt Security
+    ENABLE_PROMPT_SANITIZATION = os.getenv("ENABLE_PROMPT_SANITIZATION", "true").lower() == "true"
+    MAX_PROMPT_LENGTH = int(os.getenv("MAX_PROMPT_LENGTH", "5000"))
+    
+    # ==========================================
     # PATHS
     # ==========================================
     SCREENSHOT_DIR = os.getenv("SCREENSHOT_DIR", "./screenshots")
