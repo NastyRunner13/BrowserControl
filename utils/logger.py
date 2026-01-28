@@ -25,7 +25,7 @@ def setup_logger(name: str = __name__) -> logging.Logger:
         settings.LOG_DIR, 
         f"automation_{datetime.now().strftime('%Y%m%d')}.log"
     )
-    file_handler = logging.FileHandler(log_file)
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
     file_handler.setLevel(logging.DEBUG)
     file_formatter = logging.Formatter(
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
