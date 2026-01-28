@@ -1,11 +1,15 @@
 import asyncio
 import os
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, TYPE_CHECKING
 from playwright.async_api import Page
 from core.browser_pool import BrowserPool
 from core.element_finder import IntelligentElementFinder
 from utils.logger import setup_logger
 from config.settings import settings
+
+if TYPE_CHECKING:
+    from core.tab_manager import TabManager
+    from core.task_context import TaskContext
 
 logger = setup_logger(__name__)
 
@@ -89,9 +93,24 @@ If correction is not possible, respond with "CANNOT_CORRECT".'''
             logger.error(f"Failed to get correction: {e}")
             return None
     
-    async def execute_intelligent_step(self, page: Page, step: Dict[str, Any], 
-                                     task_context: str = "") -> str:
-        """Execute a step with intelligent reasoning capabilities."""
+    async def execute_intelligent_step(
+        self, 
+        page: Page, 
+        step: Dict[str, Any], 
+        task_context: str = "",
+        context_obj: Optional['TaskContext'] = None,
+        tab_manager: Optional['TabManager'] = None
+    ) -> str:
+        """
+        Execute a step with intelligent reasoning capabilities.
+        
+        Args:
+            page: Playwright page object
+            step: Step definition with action and parameters
+            task_context: String context for element finding
+            context_obj: Optional TaskContext for storing extracted data
+            tab_manager: Optional TabManager for multi-tab operations
+        """
         action = step['action']
         
         if action == 'intelligent_click':
@@ -99,11 +118,13 @@ If correction is not possible, respond with "CANNOT_CORRECT".'''
         elif action == 'intelligent_type':
             return await self._intelligent_type(page, step, task_context)
         elif action == 'intelligent_extract':
-            return await self._intelligent_extract(page, step, task_context)
+            return await self._intelligent_extract(page, step, task_context, context_obj)
         elif action == 'intelligent_wait':
             return await self._intelligent_wait(page, step, task_context)
         elif action == 'navigate':
             await page.goto(step['url'], wait_until='domcontentloaded', timeout=settings.BROWSER_TIMEOUT)
+            if context_obj:
+                context_obj.add_visited_url(step['url'])
             return f"Navigated to {step['url']}"
         elif action == 'click':
             await page.click(step['selector'], timeout=10000)
@@ -115,11 +136,69 @@ If correction is not possible, respond with "CANNOT_CORRECT".'''
             seconds = step.get('seconds', 1)
             await asyncio.sleep(seconds)
             return f"Waited {seconds} seconds"
+        elif action == 'scroll':
+            direction = step.get('direction', 'down')
+            amount = step.get('amount', 500)
+            if direction == 'down':
+                await page.evaluate(f"window.scrollBy(0, {amount})")
+            elif direction == 'up':
+                await page.evaluate(f"window.scrollBy(0, -{amount})")
+            elif direction == 'left':
+                await page.evaluate(f"window.scrollBy(-{amount}, 0)")
+            elif direction == 'right':
+                await page.evaluate(f"window.scrollBy({amount}, 0)")
+            return f"Scrolled {direction} by {amount} pixels"
+        elif action == 'final_answer':
+            answer = step.get('answer', 'Goal completed.')
+            print(f"\n✅ FINAL ANSWER: {answer}\n")
+            if context_obj:
+                context_obj.set_final_answer(answer)
+            return f"COMPLETED: {answer}"
         elif action == 'screenshot':
             filename = step.get('filename', f"screenshot_{int(asyncio.get_event_loop().time())}.png")
             os.makedirs(settings.SCREENSHOT_DIR, exist_ok=True)
-            await page.screenshot(path=f"{settings.SCREENSHOT_DIR}/{filename}")
+            filepath = f"{settings.SCREENSHOT_DIR}/{filename}"
+            await page.screenshot(path=filepath)
+            if context_obj:
+                context_obj.add_screenshot(filepath)
             return f"Screenshot saved: {filename}"
+        # Hover action
+        elif action == 'hover':
+            return await self._intelligent_hover(page, step, task_context)
+        # Select option action
+        elif action == 'select_option':
+            return await self._intelligent_select(page, step, task_context)
+        # Tab management actions
+        elif action == 'new_tab':
+            if not tab_manager:
+                return "Error: Tab manager not available"
+            url = step.get('url')
+            result = await tab_manager.new_tab(url)
+            if result['success']:
+                return f"Created new tab {result['tab_index']}" + (f" at {url}" if url else "")
+            return f"Failed to create new tab: {result.get('error', 'Unknown error')}"
+        elif action == 'switch_tab':
+            if not tab_manager:
+                return "Error: Tab manager not available"
+            tab_index = step.get('tab_index', 0)
+            result = await tab_manager.switch_tab(tab_index)
+            if result['success']:
+                return f"Switched to tab {tab_index}: {result.get('title', 'Unknown')}"
+            return f"Failed to switch tab: {result.get('error', 'Unknown error')}"
+        elif action == 'close_tab':
+            if not tab_manager:
+                return "Error: Tab manager not available"
+            tab_index = step.get('tab_index')
+            result = await tab_manager.close_tab(tab_index)
+            if result['success']:
+                return f"Closed tab {result['closed_tab']}, now on tab {result['active_tab']}"
+            return f"Failed to close tab: {result.get('error', 'Unknown error')}"
+        elif action == 'list_tabs':
+            if not tab_manager:
+                return "Error: Tab manager not available"
+            result = await tab_manager.list_tabs()
+            tabs_str = ", ".join([f"[{t['index']}]{' (active)' if t['is_active'] else ''}: {t.get('title', 'Unknown')[:30]}" for t in result['tabs']])
+            return f"Open tabs ({result['total_tabs']}): {tabs_str}"
         else:
             raise ValueError(f"Unknown action: {action}")
     
@@ -204,6 +283,7 @@ If correction is not possible, respond with "CANNOT_CORRECT".'''
         """Intelligently find and type into an element with self-correction."""
         description = step['description']
         text = step['text']
+        press_enter = step.get('press_enter', False)
         original_description = description
         max_attempts = settings.MAX_CORRECTION_ATTEMPTS + 1 if settings.ENABLE_SELF_CORRECTION else 1
         
@@ -234,10 +314,13 @@ If correction is not possible, respond with "CANNOT_CORRECT".'''
                 await page.wait_for_timeout(500)
                 await page.fill(selector, text, timeout=10000)
                 
-                success_msg = f"✓ Typed '{text}' into '{original_description}'"
-                if description != original_description:
-                    success_msg += f" (corrected to: '{description}')"
-                return success_msg
+                result_msg = f"✓ Typed '{text}' into '{description}'"
+                        
+                if press_enter:
+                    await page.keyboard.press("Enter")
+                    result_msg += " and pressed Enter"
+                    
+                return result_msg
                 
             except Exception as e:
                 last_error = str(e)
@@ -252,10 +335,17 @@ If correction is not possible, respond with "CANNOT_CORRECT".'''
         
         raise Exception(f"Failed after {max_attempts} attempts: {last_error}")
     
-    async def _intelligent_extract(self, page: Page, step: Dict[str, Any], context: str) -> str:
-        """Intelligently extract data from elements."""
+    async def _intelligent_extract(
+        self, 
+        page: Page, 
+        step: Dict[str, Any], 
+        context: str,
+        context_obj: Optional['TaskContext'] = None
+    ) -> str:
+        """Intelligently extract data from elements and store in context."""
         description = step['description']
         data_type = step.get('data_type', 'text')
+        store_as = step.get('store_as', description)  # Key to store data under
         
         find_result = await self.element_finder.find_element_intelligently(
             page, description, context
@@ -276,10 +366,69 @@ If correction is not possible, respond with "CANNOT_CORRECT".'''
             else:
                 data = await page.text_content(selector, timeout=5000)
             
+            # Store in context if available
+            if context_obj and data:
+                context_obj.store_extracted_data(store_as, data)
+            
             return f"Extracted from '{description}': {str(data)[:200]}"
             
         except Exception as e:
             return f"Failed to extract from '{description}': {str(e)}"
+    
+    async def _intelligent_hover(self, page: Page, step: Dict[str, Any], context: str) -> str:
+        """Intelligently find and hover over an element."""
+        description = step['description']
+        
+        find_result = await self.element_finder.find_element_intelligently(
+            page, description, context
+        )
+        
+        if not find_result['success']:
+            return f"Could not find element to hover: {description}"
+        
+        selector = find_result['selector']
+        
+        try:
+            locator = page.locator(selector).first
+            await locator.scroll_into_view_if_needed(timeout=5000)
+            await locator.hover(timeout=5000)
+            return f"✓ Hovered over '{description}'"
+            
+        except Exception as e:
+            return f"Failed to hover over '{description}': {str(e)}"
+    
+    async def _intelligent_select(self, page: Page, step: Dict[str, Any], context: str) -> str:
+        """Intelligently select an option from a dropdown."""
+        description = step['description']
+        value = step.get('value', '')
+        by = step.get('by', 'value')  # 'value', 'label', or 'index'
+        
+        find_result = await self.element_finder.find_element_intelligently(
+            page, description, context
+        )
+        
+        if not find_result['success']:
+            return f"Could not find dropdown: {description}"
+        
+        selector = find_result['selector']
+        
+        try:
+            locator = page.locator(selector).first
+            await locator.scroll_into_view_if_needed(timeout=5000)
+            
+            if by == 'value':
+                await locator.select_option(value=value, timeout=5000)
+            elif by == 'label':
+                await locator.select_option(label=value, timeout=5000)
+            elif by == 'index':
+                await locator.select_option(index=int(value), timeout=5000)
+            else:
+                await locator.select_option(value=value, timeout=5000)
+            
+            return f"✓ Selected '{value}' in dropdown '{description}'"
+            
+        except Exception as e:
+            return f"Failed to select in '{description}': {str(e)}"
     
     async def _intelligent_wait(self, page: Page, step: Dict[str, Any], context: str) -> str:
         """Intelligently wait for conditions."""

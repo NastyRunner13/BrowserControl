@@ -7,21 +7,37 @@ class TaskValidator:
     """Validator for task definitions."""
     
     VALID_ACTIONS = {
-        'navigate', 'click', 'type', 'wait', 'screenshot',
+        # Basic actions
+        'navigate', 'click', 'type', 'wait', 'screenshot', 'scroll',
+        # Intelligent actions
         'intelligent_click', 'intelligent_type', 'intelligent_extract',
-        'intelligent_wait'
+        'intelligent_wait',
+        # Response actions
+        'final_answer',
+        # Interaction actions
+        'hover', 'select_option',
+        # Tab management
+        'new_tab', 'switch_tab', 'close_tab', 'list_tabs'
     }
     
     REQUIRED_PARAMS = {
         'navigate': ['url'],
         'click': ['selector'],
         'type': ['selector', 'text'],
-        'wait': ['seconds'],
+        'wait': [],  # seconds is optional, defaults to 1
         'screenshot': [],
+        'scroll': [],  # direction and amount are optional
         'intelligent_click': ['description'],
         'intelligent_type': ['description', 'text'],
         'intelligent_extract': ['description'],
-        'intelligent_wait': ['condition']
+        'intelligent_wait': ['condition'],
+        'final_answer': ['answer'],
+        'hover': ['description'],
+        'select_option': ['description', 'value'],
+        'new_tab': [],  # url is optional
+        'switch_tab': ['tab_index'],
+        'close_tab': [],  # tab_index is optional
+        'list_tabs': []
     }
     
     @staticmethod
