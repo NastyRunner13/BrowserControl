@@ -67,17 +67,30 @@ class AutomationAgent:
 
         AVAILABLE ACTIONS:
         1. "navigate": {"action": "navigate", "url": "https://..."}
-        2. "intelligent_type": {"action": "intelligent_type", "description": "element visual description", "text": "what to type"}
+        2. "intelligent_type": {"action": "intelligent_type", "description": "...", "text": "...", "press_enter": true} 
+        (Set press_enter to true ONLY if you want to submit a search immediately)
         3. "intelligent_click": {"action": "intelligent_click", "description": "element visual description"}
         4. "intelligent_wait": {"action": "intelligent_wait", "condition": "element", "description": "what to wait for", "timeout": 10000}
-        5. "intelligent_extract": {"action": "intelligent_extract", "description": "element to read", "data_type": "text"}
+        5. "intelligent_extract": {"action": "intelligent_extract", "description": "element to read", "data_type": "text", "store_as": "variable_name"}
         6. "screenshot": {"action": "screenshot", "filename": "result_context.png"}
         7. "wait": {"action": "wait", "seconds": 2}
+        8. "scroll": {"action": "scroll", "direction": "down|up|left|right", "amount": 500}
+        9. "final_answer": {"action": "final_answer", "answer": "The answer to user's question with extracted data"}
+        10. "hover": {"action": "hover", "description": "element to hover over"}
+        11. "select_option": {"action": "select_option", "description": "dropdown element", "value": "option value", "by": "value|label|index"}
+        
+        TAB MANAGEMENT:
+        12. "new_tab": {"action": "new_tab", "url": "https://..."} - Open a new tab
+        13. "switch_tab": {"action": "switch_tab", "tab_index": 0} - Switch to tab by index
+        14. "close_tab": {"action": "close_tab", "tab_index": 0} - Close a tab (optional index)
+        15. "list_tabs": {"action": "list_tabs"} - List all open tabs
 
         RULES:
         - Return ONLY a JSON list of task objects. No markdown, no explanations.
         - "task_id" should be short, snake_case, and unique.
         - Always start with "navigate".
+        - Use "intelligent_extract" to get data from pages, then "final_answer" to respond to user questions.
+        - Use tab actions when user needs to work across multiple sites/pages.
         
         EXAMPLE OUTPUT STRUCTURE:
         [
@@ -180,11 +193,15 @@ class DynamicAutomationAgent:
         pool = None
         browser_instance = None
         step_count = 0
+        task_context = None
+        tab_manager = None
         
         try:
-            # Initialize browser pool
+            # Initialize browser pool and context
             from core.browser_pool import BrowserPool
             from core.executor import IntelligentParallelExecutor
+            from core.tab_manager import TabManager
+            from core.task_context import TaskContext
             
             pool = BrowserPool(max_browsers=1, headless=headless)
             await pool.initialize()
@@ -193,6 +210,10 @@ class DynamicAutomationAgent:
             browser_instance = await pool.get_browser_instance("dynamic_agent")
             page = browser_instance.page
             executor = IntelligentParallelExecutor(pool)
+            
+            # Initialize TabManager and TaskContext
+            tab_manager = TabManager(browser_instance.context, initial_page=page)
+            task_context = TaskContext(original_goal=user_goal)
             
             # Agent loop
             step_count = 0
@@ -227,19 +248,34 @@ class DynamicAutomationAgent:
                     goal_achieved = True
                     break
                 
+                # Check if final_answer - this also ends execution
+                if next_action.get('action') == 'final_answer':
+                    answer = next_action.get('answer', 'Task completed.')
+                    print(f"\n✅ FINAL ANSWER: {answer}\n")
+                    if task_context:
+                        task_context.set_final_answer(answer)
+                    goal_achieved = True
+                    break
+                
                 print(f"🎬 Action: {next_action.get('action')}")
                 if next_action.get('description'):
                     print(f"   Target: {next_action['description']}")
                 if next_action.get('url'):
                     print(f"   URL: {next_action['url']}")
                 
-                # 3. Execute action with self-correction
+                # 3. Execute action with self-correction (pass context and tab manager)
                 execution_result = await self._execute_with_correction(
                     page, 
                     executor, 
                     next_action,
-                    state
+                    state,
+                    context_obj=task_context,
+                    tab_manager=tab_manager
                 )
+                
+                # Update page reference if tab was switched
+                if tab_manager and next_action.get('action') in ['switch_tab', 'new_tab']:
+                    page = tab_manager.active_page
                 
                 # 4. Record history
                 self.action_history.append({
@@ -275,23 +311,43 @@ class DynamicAutomationAgent:
                 print("❌ FAILED: Agent could not complete the goal")
             
             print(f"📊 Total steps executed: {step_count}")
+            
+            # Show extracted data and final answer
+            if task_context:
+                if task_context.final_answer:
+                    print(f"\n📝 FINAL ANSWER: {task_context.final_answer}")
+                if task_context.extracted_data:
+                    print(f"📊 Extracted Data: {task_context.extracted_data}")
+            
             print(f"{'='*60}\n")
             
-            return {
+            # Build result with TaskContext data
+            result = {
                 'success': goal_achieved,
                 'steps_taken': step_count,
                 'history': self.action_history
             }
             
+            if task_context:
+                result['final_answer'] = task_context.final_answer
+                result['extracted_data'] = task_context.extracted_data
+                result['visited_urls'] = task_context.visited_urls
+                result['screenshots'] = task_context.screenshots
+            
+            return result
+            
         except Exception as e:
             logger.error(f"Dynamic agent failed: {e}")
             print(f"\n❌ Agent Error: {e}")
-            return {
+            result = {
                 'success': False,
                 'error': str(e),
                 'steps_taken': step_count if 'step_count' in locals() else 0,
                 'history': self.action_history
             }
+            if task_context:
+                result['extracted_data'] = task_context.extracted_data
+            return result
             
         finally:
             if browser_instance and pool:
@@ -334,14 +390,31 @@ class DynamicAutomationAgent:
         history: List[Dict[str, Any]]
     ) -> Optional[Dict[str, Any]]:
         """Use LLM to decide the next single action based on current state."""
-        # Format recent history (last 5 actions)
+        # Format recent history (last 5 actions) - INCLUDE RESULTS so LLM knows what data it has
         recent_history = history[-settings.AGENT_HISTORY_LENGTH:] if len(history) > settings.AGENT_HISTORY_LENGTH else history
-        history_text = "\n".join([
-            f"  {h['step']}. {h['action'].get('action')} - {h['result'].get('status', 'unknown')}"
-            for h in recent_history
-        ])
+        history_lines = []
+        for h in recent_history:
+            action = h['action'].get('action', 'unknown')
+            status = h['result'].get('status', 'unknown')
+            result_data = h['result'].get('result', '')
+            
+            # Truncate long results
+            if result_data and len(str(result_data)) > 100:
+                result_data = str(result_data)[:100] + "..."
+            
+            line = f"  {h['step']}. {action}"
+            if h['action'].get('description'):
+                line += f" → '{h['action']['description']}'"
+            if h['action'].get('url'):
+                line += f" → {h['action']['url']}"
+            line += f" → {status}"
+            if result_data and action in ['intelligent_extract', 'navigate']:
+                line += f" | Data: {result_data}"
+            history_lines.append(line)
         
-        prompt = f"""You are an autonomous web automation agent.
+        history_text = "\n".join(history_lines)
+        
+        prompt = f"""You are an autonomous web automation agent that completes tasks step by step.
 
 GOAL: {user_goal}
 
@@ -353,32 +426,39 @@ CURRENT STATE:
 HISTORY (Recent Actions):
 {history_text if history_text else 'No actions yet'}
 
-TASK: Decide the ONE next action to take toward the goal.
-
 AVAILABLE ACTIONS:
-- navigate: Go to a URL
-- intelligent_click: Click an element (by description)
-- intelligent_type: Type into an element (by description)
-- intelligent_wait: Wait for an element to appear
-- wait: Wait N seconds
-- screenshot: Take a screenshot
-- goal_achieved: Goal is complete
+- navigate: Go to URL {{"action": "navigate", "url": "https://..."}}
+- intelligent_click: Click element {{"action": "intelligent_click", "description": "what to click"}}
+- intelligent_type: Type text {{"action": "intelligent_type", "description": "input field", "text": "...", "press_enter": true/false}}
+- intelligent_extract: Get data {{"action": "intelligent_extract", "description": "what to extract"}}
+- scroll: Scroll page {{"action": "scroll", "direction": "down", "amount": 500}}
+- wait: Wait {{"action": "wait", "seconds": 2}}
+- new_tab: New tab {{"action": "new_tab", "url": "https://..."}}
+- switch_tab: Switch tab {{"action": "switch_tab", "tab_index": 0}}
+- final_answer: END execution {{"action": "final_answer", "answer": "Your complete response"}}
 
-IMPORTANT RULES:
-1. If the goal is already achieved, return {{"action": "goal_achieved", "reasoning": "why"}}
-2. If stuck after multiple failed attempts, try a different approach
-3. Handle popups, cookie banners, and navigation carefully
-4. Always navigate to a URL first if not already there
+RULES:
+1. Return exactly ONE action per response as JSON
+2. Infer URLs from site names (e.g., "Amazon" → https://www.amazon.in)
+3. Use SCROLL when you need to see more content on the page
+4. Use CLICK to navigate deeper (e.g., click a link to see full details)
+5. Check HISTORY - don't repeat the same action or revisit completed sites
+6. Use FINAL_ANSWER when you have all info needed to answer the user - this ENDS execution
 
-Respond with ONLY a JSON object (no markdown, no backticks):
+Respond with ONLY a JSON object (no markdown):
 {{
   "action": "action_name",
-  "url": "https://..." (if navigate),
-  "description": "element description" (if intelligent action),
-  "text": "text to type" (if intelligent_type),
-  "seconds": 3 (if wait),
-  "reasoning": "brief explanation of why this action"
-}}"""
+  "url": "..." (for navigate/new_tab),
+  "description": "..." (for click/type/extract),
+  "text": "..." (for type),
+  "press_enter": true/false (for type),
+  "direction": "down" (for scroll),
+  "amount": 500 (for scroll),
+  "answer": "..." (for final_answer),
+  "reasoning": "why this action"
+}}
+
+"""
 
         try:
             response = await self.llm.ainvoke([{"role": "user", "content": prompt}])
@@ -405,7 +485,9 @@ Respond with ONLY a JSON object (no markdown, no backticks):
         executor,
         action: Dict[str, Any],
         state: Dict[str, Any],
-        max_retries: Optional[int] = None
+        max_retries: Optional[int] = None,
+        context_obj: Optional[Any] = None,
+        tab_manager: Optional[Any] = None
     ) -> Dict[str, Any]:
         """Execute action with self-correction on failure."""
         max_retries = max_retries or settings.MAX_CORRECTION_ATTEMPTS
@@ -414,8 +496,14 @@ Respond with ONLY a JSON object (no markdown, no backticks):
         
         while attempt <= max_retries:
             try:
-                # Execute the action
-                result = await executor.execute_intelligent_step(page, action, context="")
+                # Execute the action with context and tab manager
+                result = await executor.execute_intelligent_step(
+                    page, 
+                    action, 
+                    task_context="",
+                    context_obj=context_obj,
+                    tab_manager=tab_manager
+                )
                 
                 return {
                     'status': 'success',
