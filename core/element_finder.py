@@ -360,12 +360,33 @@ class IntelligentElementFinder:
                                 const cleanText = text.trim().replace(/\\s+/g, ' ');
                                 
                                 function generateBestSelector(element) {
-                                    if (element.id) return `#${element.id}`;
-                                    if (element.name) return `[name="${element.name}"]`;
+                                    if (element.id) return `#${CSS.escape(element.id)}`;
+                                    if (element.name) return `${element.tagName.toLowerCase()}[name="${element.name}"]`;
                                     
                                     const ariaLabel = element.getAttribute('aria-label');
                                     if (ariaLabel) return `[aria-label="${ariaLabel}"]`;
                                     
+                                    const testId = element.getAttribute('data-testid');
+                                    if (testId) return `[data-testid="${testId}"]`;
+                                    
+                                    // Combine tag + type + placeholder for inputs
+                                    if (element.tagName === 'INPUT' && element.type) {
+                                        if (element.placeholder) 
+                                            return `input[type="${element.type}"][placeholder="${element.placeholder}"]`;
+                                        return `input[type="${element.type}"]`;
+                                    }
+                                    
+                                    // Use role attribute if available
+                                    const role = element.getAttribute('role');
+                                    if (role) {
+                                        const text = element.textContent?.trim();
+                                        if (text && text.length < 30) {
+                                            return `[role="${role}"]:has-text("${text.substring(0, 25)}")`;
+                                        }
+                                        return `[role="${role}"]`;
+                                    }
+                                    
+                                    // Fallback with parent context
                                     const tagName = element.tagName.toLowerCase();
                                     const parent = element.parentNode;
                                     if (parent) {
