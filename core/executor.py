@@ -4,6 +4,7 @@ from typing import Dict, Any, Optional, TYPE_CHECKING
 from playwright.async_api import Page
 from core.browser_pool import BrowserPool
 from core.element_finder import IntelligentElementFinder
+from core.overlay_detector import OverlayDetector
 from utils.logger import setup_logger
 from config.settings import settings
 
@@ -123,6 +124,11 @@ If correction is not possible, respond with "CANNOT_CORRECT".'''
             return await self._intelligent_wait(page, step, task_context)
         elif action == 'navigate':
             await page.goto(step['url'], wait_until='domcontentloaded', timeout=settings.BROWSER_TIMEOUT)
+            # Wait for JS-heavy SPAs to finish loading
+            try:
+                await page.wait_for_load_state('networkidle', timeout=10000)
+            except Exception:
+                await asyncio.sleep(1)  # Fallback: just wait a second
             if context_obj:
                 context_obj.add_visited_url(step['url'])
             return f"Navigated to {step['url']}"
@@ -203,11 +209,12 @@ If correction is not possible, respond with "CANNOT_CORRECT".'''
             raise ValueError(f"Unknown action: {action}")
     
     async def _intelligent_click(self, page: Page, step: Dict[str, Any], context: str) -> str:
-        """Intelligently find and click an element with self-correction."""
+        """Intelligently find and click an element with overlay handling and self-correction."""
         description = step['description']
-        original_description = description  # Keep original for logging
+        original_description = description
         max_attempts = settings.MAX_CORRECTION_ATTEMPTS + 1 if settings.ENABLE_SELF_CORRECTION else 1
         
+        overlay_detector = OverlayDetector(page)
         last_error = None
         
         for attempt in range(max_attempts):
@@ -220,63 +227,99 @@ If correction is not possible, respond with "CANNOT_CORRECT".'''
                 if not find_result['success']:
                     last_error = find_result.get('error', 'Element not found')
                     
-                    # Try correction if not last attempt
                     if attempt < max_attempts - 1:
                         logger.warning(f"❌ Attempt {attempt + 1}/{max_attempts} failed: {last_error}")
                         corrected_desc = await self._ask_for_correction(page, description, last_error)
                         
                         if corrected_desc:
                             description = corrected_desc
-                            continue  # Retry with corrected description
+                            continue
                         else:
                             logger.info("No correction available, proceeding to next attempt...")
                     
-                    # No correction or last attempt
                     raise Exception(f"Could not find element: {original_description}")
                 
                 selector = find_result['selector']
+                locator = page.locator(selector).first
                 
-                # Try to click
-                try:
-                    # 1. Scroll into view
-                    locator = page.locator(selector).first
-                    await locator.scroll_into_view_if_needed(timeout=5000)
-                    
-                    # 2. Scroll back up slightly (avoid sticky headers)
-                    await page.evaluate("window.scrollBy(0, -100)")
+                # Try to click with overlay handling
+                click_success = False
+                
+                for click_attempt in range(3):  # Up to 3 click attempts
+                    try:
+                        # 1. Scroll into view
+                        await locator.scroll_into_view_if_needed(timeout=5000)
+                        await page.evaluate("window.scrollBy(0, -100)")
+                        await asyncio.sleep(0.3)
+                        
+                        # 2. Try normal click
+                        await locator.click(timeout=5000)
+                        click_success = True
+                        break
+                        
+                    except Exception as click_error:
+                        error_msg = str(click_error).lower()
+                        
+                        # Check if blocked by overlay
+                        if 'intercepts pointer' in error_msg or 'element is not clickable' in error_msg:
+                            logger.info(f"Click blocked by overlay, attempting to dismiss...")
+                            
+                            # Try to dismiss overlays
+                            dismissed = await overlay_detector.dismiss_overlays()
+                            if dismissed > 0:
+                                logger.info(f"Dismissed {dismissed} overlays, retrying click...")
+                                await asyncio.sleep(0.5)
+                                continue
+                            
+                            # Try force click
+                            try:
+                                await locator.click(force=True, timeout=3000)
+                                click_success = True
+                                break
+                            except:
+                                pass
+                            
+                            # Try coordinate-based click as final fallback
+                            try:
+                                box = await locator.bounding_box()
+                                if box:
+                                    center_x = box['x'] + box['width'] / 2
+                                    center_y = box['y'] + box['height'] / 2
+                                    await page.mouse.click(center_x, center_y)
+                                    logger.info(f"Clicked at coordinates ({center_x}, {center_y})")
+                                    click_success = True
+                                    break
+                            except Exception as coord_error:
+                                logger.debug(f"Coordinate click failed: {coord_error}")
+                        
+                        # Last click attempt failed
+                        if click_attempt == 2:
+                            raise Exception(f"Failed to click after overlay handling: {click_error}")
+                
+                if click_success:
+                    # Wait for page to stabilize after click (handles SPA transitions)
+                    try:
+                        await page.wait_for_load_state('domcontentloaded', timeout=5000)
+                    except Exception:
+                        pass
                     await asyncio.sleep(0.5)
-                    
-                    # 3. Click
-                    await locator.click(timeout=10000)
                     
                     success_msg = f"✓ Clicked '{original_description}'"
                     if description != original_description:
                         success_msg += f" (corrected to: '{description}')"
                     return success_msg
                     
-                except Exception as click_error:
-                    # Try force click as fallback
-                    try:
-                        await page.locator(selector).first.click(force=True, timeout=5000)
-                        return f"✓ Force-clicked '{original_description}'"
-                    except:
-                        raise Exception(f"Failed to click '{description}': {str(click_error)}")
-                
             except Exception as e:
                 last_error = str(e)
                 if attempt < max_attempts - 1:
                     logger.warning(f"Click attempt {attempt + 1}/{max_attempts} failed: {last_error}")
-                    logger.info("Retrying with correction...")
-                    # Try to get correction for next attempt
                     corrected_desc = await self._ask_for_correction(page, description, last_error)
                     if corrected_desc:
                         description = corrected_desc
                     continue
                 else:
-                    # Last attempt failed
                     raise
         
-        # Should not reach here, but just in case
         raise Exception(f"Failed after {max_attempts} attempts: {last_error}")
     
     async def _intelligent_type(self, page: Page, step: Dict[str, Any], context: str) -> str:
@@ -310,9 +353,23 @@ If correction is not possible, respond with "CANNOT_CORRECT".'''
                 
                 selector = find_result['selector']
                 
-                await page.locator(selector).scroll_into_view_if_needed(timeout=5000)
+                # Handle strict mode: if selector matches multiple elements, narrow it down
+                locator = page.locator(selector)
+                element_count = await locator.count()
+                
+                if element_count > 1:
+                    # For input fields, try excluding readonly/disabled elements  
+                    narrowed = page.locator(f"{selector}:not([readonly]):not([disabled])")
+                    narrowed_count = await narrowed.count()
+                    if narrowed_count >= 1:
+                        locator = narrowed.first
+                    else:
+                        locator = locator.first
+                    logger.info(f"Selector '{selector}' matched {element_count} elements, narrowed to first non-readonly")
+                
+                await locator.scroll_into_view_if_needed(timeout=5000)
                 await page.wait_for_timeout(500)
-                await page.fill(selector, text, timeout=10000)
+                await locator.fill(text, timeout=10000)
                 
                 result_msg = f"✓ Typed '{text}' into '{description}'"
                         
@@ -342,38 +399,128 @@ If correction is not possible, respond with "CANNOT_CORRECT".'''
         context: str,
         context_obj: Optional['TaskContext'] = None
     ) -> str:
-        """Intelligently extract data from elements and store in context."""
+        """Intelligently extract data from elements and store in context.
+        
+        Supports both single-element and multi-element extraction.
+        For multi-element requests (e.g., 'product prices', 'first 3 results'),
+        uses page-level JS extraction as fallback.
+        """
         description = step['description']
         data_type = step.get('data_type', 'text')
-        store_as = step.get('store_as', description)  # Key to store data under
+        store_as = step.get('store_as', description)
         
+        # Detect multi-element intent
+        multi_keywords = ['prices', 'results', 'items', 'products', 'listings', 
+                         'titles', 'names', 'links', 'options', 'all', 'list',
+                         'first', 'top', 'multiple']
+        is_multi = any(kw in description.lower() for kw in multi_keywords)
+        
+        # TIER 1: Try standard single-element finder
         find_result = await self.element_finder.find_element_intelligently(
             page, description, context
         )
         
-        if not find_result['success']:
-            return f"Could not find element for extraction: {description}"
+        if find_result['success']:
+            selector = find_result['selector']
+            try:
+                if is_multi:
+                    # Try to get multiple matching elements
+                    data = await page.evaluate(f"""
+                        (selector) => {{
+                            const elements = document.querySelectorAll(selector);
+                            if (elements.length > 1) {{
+                                return Array.from(elements)
+                                    .slice(0, 10)
+                                    .map((el, i) => `${{i+1}}. ${{el.textContent.trim().substring(0, 150)}}`)
+                                    .join('; ');
+                            }}
+                            // Single element - get its text
+                            return elements[0]?.textContent?.trim() || '';
+                        }}
+                    """, selector)
+                elif data_type == 'text':
+                    data = await page.text_content(selector, timeout=5000)
+                elif data_type == 'html':
+                    data = await page.inner_html(selector, timeout=5000)
+                elif data_type == 'value':
+                    data = await page.input_value(selector, timeout=5000)
+                else:
+                    data = await page.text_content(selector, timeout=5000)
+                
+                if context_obj and data:
+                    context_obj.store_extracted_data(store_as, data)
+                
+                return f"Extracted from '{description}': {str(data)[:500]}"
+                
+            except Exception as e:
+                logger.warning(f"Standard extraction failed: {e}, trying page-level fallback")
         
-        selector = find_result['selector']
+        # TIER 2: Page-level JS extraction fallback for multi-element requests
+        if is_multi:
+            try:
+                data = await page.evaluate("""
+                    (description) => {
+                        const desc = description.toLowerCase();
+                        let results = [];
+                        
+                        // Try to find price elements
+                        if (desc.includes('price')) {
+                            const priceSelectors = [
+                                '[class*="price"]', '[data-price]', '[itemprop="price"]',
+                                '[class*="Price"]', '[class*="cost"]', '[class*="amount"]'
+                            ];
+                            for (const sel of priceSelectors) {
+                                const els = document.querySelectorAll(sel);
+                                if (els.length > 0) {
+                                    results = Array.from(els)
+                                        .slice(0, 10)
+                                        .map(el => el.textContent.trim())
+                                        .filter(t => t && t.length < 100);
+                                    if (results.length > 0) break;
+                                }
+                            }
+                        }
+                        
+                        // Try to find product/title elements
+                        if (results.length === 0 && (desc.includes('title') || desc.includes('product') || desc.includes('name'))) {
+                            const titleSelectors = [
+                                '[class*="title"]', '[class*="product-name"]', '[class*="productName"]',
+                                'h2 a', 'h3 a', '[itemprop="name"]'
+                            ];
+                            for (const sel of titleSelectors) {
+                                const els = document.querySelectorAll(sel);
+                                if (els.length > 0) {
+                                    results = Array.from(els)
+                                        .slice(0, 10)
+                                        .map(el => el.textContent.trim())
+                                        .filter(t => t && t.length > 3 && t.length < 200);
+                                    if (results.length > 0) break;
+                                }
+                            }
+                        }
+                        
+                        // Generic: try main content area
+                        if (results.length === 0) {
+                            const mainContent = document.querySelector('main, [role="main"], #content, .content');
+                            if (mainContent) {
+                                return mainContent.innerText.substring(0, 1000);
+                            }
+                            return document.body.innerText.substring(0, 800);
+                        }
+                        
+                        return results.map((r, i) => `${i+1}. ${r}`).join('; ');
+                    }
+                """, description)
+                
+                if data and context_obj:
+                    context_obj.store_extracted_data(store_as, data)
+                
+                return f"Extracted from '{description}': {str(data)[:500]}"
+                
+            except Exception as e:
+                return f"Failed to extract '{description}': {str(e)}"
         
-        try:
-            if data_type == 'text':
-                data = await page.text_content(selector, timeout=5000)
-            elif data_type == 'html':
-                data = await page.inner_html(selector, timeout=5000)
-            elif data_type == 'value':
-                data = await page.input_value(selector, timeout=5000)
-            else:
-                data = await page.text_content(selector, timeout=5000)
-            
-            # Store in context if available
-            if context_obj and data:
-                context_obj.store_extracted_data(store_as, data)
-            
-            return f"Extracted from '{description}': {str(data)[:200]}"
-            
-        except Exception as e:
-            return f"Failed to extract from '{description}': {str(e)}"
+        return f"Could not find element for extraction: {description}"
     
     async def _intelligent_hover(self, page: Page, step: Dict[str, Any], context: str) -> str:
         """Intelligently find and hover over an element."""
