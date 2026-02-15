@@ -21,7 +21,7 @@ class Settings:
     # ==========================================
     # LLM CONFIGURATION
     # ==========================================
-    LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
+    LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
     LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.1"))
     
     # Vision LLM
