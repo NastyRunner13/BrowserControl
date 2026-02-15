@@ -214,6 +214,7 @@ class DynamicAutomationAgent:
             # Initialize TabManager and TaskContext
             tab_manager = TabManager(browser_instance.context, initial_page=page)
             task_context = TaskContext(original_goal=user_goal)
+            self._task_context = task_context  # Store for access in _decide_next_action
             
             # Agent loop
             step_count = 0
@@ -228,16 +229,42 @@ class DynamicAutomationAgent:
                 # 1. Observe current state
                 state = await self._capture_state(page)
                 
-                # 2. Decide next action
+                # 2. Decide next action (now with TaskContext for memory)
                 next_action = await self._decide_next_action(
                     user_goal, 
                     state, 
-                    self.action_history
+                    self.action_history,
+                    task_context=task_context
                 )
                 
                 if not next_action:
                     logger.error("❌ Agent failed to decide next action")
                     print("❌ Failed to decide next action")
+                    break
+                
+                # Loop detection: if the same action+description repeats 3+ times, force final_answer
+                action_key = f"{next_action.get('action')}:{next_action.get('description', '')}"
+                recent_actions = [
+                    f"{h['action'].get('action')}:{h['action'].get('description', '')}" 
+                    for h in self.action_history[-4:]
+                ]
+                repeat_count = sum(1 for a in recent_actions if a == action_key)
+                if repeat_count >= 2:
+                    logger.warning(f"⚠️ Loop detected: '{action_key}' repeated {repeat_count + 1} times. Forcing final_answer.")
+                    print(f"⚠️ Loop detected, generating final answer with collected data...")
+                    # Use whatever data we have
+                    if task_context and task_context.has_data_for_answer():
+                        summary = task_context.build_summary()
+                        extracted = summary.get('extracted_data', {})
+                        answer_parts = []
+                        for key, value in extracted.items():
+                            answer_parts.append(f"{key}: {value}")
+                        answer = "Based on the data I extracted:\n" + "\n".join(answer_parts) if answer_parts else "I was unable to extract the requested information."
+                    else:
+                        answer = "I was unable to fully complete the task after multiple attempts."
+                    print(f"\n✅ FINAL ANSWER: {answer}\n")
+                    task_context.set_final_answer(answer)
+                    goal_achieved = True
                     break
                 
                 # Check if goal is achieved
@@ -361,18 +388,39 @@ class DynamicAutomationAgent:
             url = page.url
             title = await page.title()
             
-            # Get snippet of visible text
+            # Get more visible text for better reasoning (1500 chars with smart sampling)
             visible_text = await page.evaluate("""
                 () => {
                     const body = document.body;
-                    return body.innerText.substring(0, 500);
+                    const text = body.innerText;
+                    if (text.length > 2000) {
+                        return text.substring(0, 1200) + ' ... ' + text.substring(text.length - 300);
+                    }
+                    return text.substring(0, 1500);
+                }
+            """)
+            
+            # Get summary of interactive elements on page
+            input_fields = await page.evaluate("""
+                () => {
+                    return Array.from(document.querySelectorAll('input, textarea, [role="search"], select'))
+                        .slice(0, 8)
+                        .map(el => ({
+                            type: el.type || el.tagName.toLowerCase(),
+                            placeholder: el.placeholder || '',
+                            ariaLabel: el.getAttribute('aria-label') || '',
+                            name: el.name || '',
+                            id: el.id || ''
+                        }))
+                        .filter(el => el.placeholder || el.ariaLabel || el.name || el.id);
                 }
             """)
             
             return {
                 'url': url,
                 'title': title,
-                'visible_text': visible_text
+                'visible_text': visible_text,
+                'input_fields': input_fields
             }
             
         except Exception as e:
@@ -380,17 +428,19 @@ class DynamicAutomationAgent:
             return {
                 'url': 'unknown',
                 'title': 'unknown',
-                'visible_text': ''
+                'visible_text': '',
+                'input_fields': []
             }
     
     async def _decide_next_action(
         self, 
         user_goal: str, 
         current_state: Dict[str, Any],
-        history: List[Dict[str, Any]]
+        history: List[Dict[str, Any]],
+        task_context: Optional[Any] = None
     ) -> Optional[Dict[str, Any]]:
         """Use LLM to decide the next single action based on current state."""
-        # Format recent history (last 5 actions) - INCLUDE RESULTS so LLM knows what data it has
+        # Format recent history - INCLUDE RESULTS so LLM knows what data it has
         recent_history = history[-settings.AGENT_HISTORY_LENGTH:] if len(history) > settings.AGENT_HISTORY_LENGTH else history
         history_lines = []
         for h in recent_history:
@@ -398,9 +448,10 @@ class DynamicAutomationAgent:
             status = h['result'].get('status', 'unknown')
             result_data = h['result'].get('result', '')
             
-            # Truncate long results
-            if result_data and len(str(result_data)) > 100:
-                result_data = str(result_data)[:100] + "..."
+            # Longer truncation for extract actions (300 chars) vs others (150 chars)
+            max_len = 300 if action == 'intelligent_extract' else 150
+            if result_data and len(str(result_data)) > max_len:
+                result_data = str(result_data)[:max_len] + "..."
             
             line = f"  {h['step']}. {action}"
             if h['action'].get('description'):
@@ -408,11 +459,31 @@ class DynamicAutomationAgent:
             if h['action'].get('url'):
                 line += f" → {h['action']['url']}"
             line += f" → {status}"
-            if result_data and action in ['intelligent_extract', 'navigate']:
+            if result_data and action in ['intelligent_extract', 'navigate', 'intelligent_click']:
                 line += f" | Data: {result_data}"
             history_lines.append(line)
         
         history_text = "\n".join(history_lines)
+        
+        # Build extracted data context from TaskContext
+        extracted_data_text = ""
+        if task_context and hasattr(task_context, 'get_context_for_llm'):
+            ctx_text = task_context.get_context_for_llm()
+            if ctx_text:
+                extracted_data_text = f"\n{ctx_text}\n"
+        
+        # Format input fields info
+        input_fields_text = ""
+        input_fields = current_state.get('input_fields', [])
+        if input_fields:
+            fields_desc = ", ".join(
+                f"{f.get('type', '?')}" + 
+                (f"('{f['placeholder']}'" if f.get('placeholder') else 
+                 f"('{f['ariaLabel']}'" if f.get('ariaLabel') else 
+                 f"('{f['name']}'" if f.get('name') else "(") + ")"
+                for f in input_fields[:5]
+            )
+            input_fields_text = f"\n- Input Fields on Page: {fields_desc}"
         
         prompt = f"""You are an autonomous web automation agent that completes tasks step by step.
 
@@ -420,12 +491,13 @@ GOAL: {user_goal}
 
 CURRENT STATE:
 - URL: {current_state['url']}
-- Page Title: {current_state['title']}
-- Visible Text (first 500 chars): {current_state['visible_text'][:500]}
+- Page Title: {current_state['title']}{input_fields_text}
+- Visible Page Content:
+{current_state['visible_text'][:1200]}
 
 HISTORY (Recent Actions):
 {history_text if history_text else 'No actions yet'}
-
+{extracted_data_text}
 AVAILABLE ACTIONS:
 - navigate: Go to URL {{"action": "navigate", "url": "https://..."}}
 - intelligent_click: Click element {{"action": "intelligent_click", "description": "what to click"}}
@@ -435,15 +507,18 @@ AVAILABLE ACTIONS:
 - wait: Wait {{"action": "wait", "seconds": 2}}
 - new_tab: New tab {{"action": "new_tab", "url": "https://..."}}
 - switch_tab: Switch tab {{"action": "switch_tab", "tab_index": 0}}
-- final_answer: END execution {{"action": "final_answer", "answer": "Your complete response"}}
+- final_answer: END execution {{"action": "final_answer", "answer": "Your complete response with ALL extracted data"}}
 
 RULES:
 1. Return exactly ONE action per response as JSON
-2. Infer URLs from site names (e.g., "Amazon" → https://www.amazon.in)
+2. Infer URLs from site names (e.g., "Amazon" → https://www.amazon.in, "Flipkart" → https://www.flipkart.com)
 3. Use SCROLL when you need to see more content on the page
 4. Use CLICK to navigate deeper (e.g., click a link to see full details)
 5. Check HISTORY - don't repeat the same action or revisit completed sites
 6. Use FINAL_ANSWER when you have all info needed to answer the user - this ENDS execution
+7. When using FINAL_ANSWER, include ALL previously extracted data in your answer
+8. For extraction, be SPECIFIC about what you want (e.g., "product prices" not just "data")
+9. After typing in a search box, set press_enter to true to submit the search
 
 Respond with ONLY a JSON object (no markdown):
 {{

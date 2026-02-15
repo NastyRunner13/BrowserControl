@@ -104,7 +104,7 @@ class TaskContext:
         
         lines = ["PREVIOUSLY EXTRACTED DATA:"]
         for key, value in self.extracted_data.items():
-            value_str = str(value)[:200]
+            value_str = str(value)[:500]
             lines.append(f"  - {key}: {value_str}")
         
         return "\n".join(lines)
