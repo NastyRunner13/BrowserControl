@@ -34,6 +34,11 @@ class Settings:
         "llama-3.2-11b-vision-preview"
     ]
     
+    # Fallback LLM (activated on rate limits / provider errors)
+    ENABLE_LLM_FALLBACK = os.getenv("ENABLE_LLM_FALLBACK", "true").lower() == "true"
+    FALLBACK_LLM_MODEL = os.getenv("FALLBACK_LLM_MODEL", "")
+    FALLBACK_LLM_API_KEY = os.getenv("FALLBACK_LLM_API_KEY", "")
+    
     # ==========================================
     # EXECUTION CONFIGURATION
     # ==========================================
@@ -98,7 +103,8 @@ class Settings:
             "dynamic_agent": Settings.ENABLE_DYNAMIC_AGENT,
             "self_correction": Settings.ENABLE_SELF_CORRECTION,
             "persistent_context": Settings.ENABLE_PERSISTENT_CONTEXT,
-            "vision_fallback": Settings.ENABLE_VISION_FALLBACK
+            "vision_fallback": Settings.ENABLE_VISION_FALLBACK,
+            "llm_fallback": Settings.ENABLE_LLM_FALLBACK
         }
     
     # ==========================================
@@ -144,7 +150,14 @@ class Settings:
         if Settings.BROWSER_TIMEOUT < 5000:
             warnings.append("BROWSER_TIMEOUT is very low - may cause timeouts")
         
-        # 4. Security warnings
+        # 4. Fallback LLM validation
+        if Settings.ENABLE_LLM_FALLBACK and not Settings.FALLBACK_LLM_MODEL:
+            warnings.append(
+                "LLM_FALLBACK is enabled but FALLBACK_LLM_MODEL is not set. "
+                "Set FALLBACK_LLM_MODEL and FALLBACK_LLM_API_KEY in .env for auto-failover."
+            )
+        
+        # 5. Security warnings
         if Settings.ENABLE_PERSISTENT_CONTEXT:
             warnings.append(
                 "⚠️  PERSISTENT_CONTEXT is enabled. This stores auth tokens on disk. "

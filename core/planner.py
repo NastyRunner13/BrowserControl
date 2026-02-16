@@ -30,6 +30,59 @@ class AutomationAgent:
             temperature=0.1,
             api_key=secret_api_key 
         )
+        
+        self._fallback_llm = self._create_fallback_llm()
+        self._using_fallback = False
+    
+    def _create_fallback_llm(self):
+        """Create fallback LLM if configured."""
+        if not settings.ENABLE_LLM_FALLBACK or not settings.FALLBACK_LLM_MODEL:
+            return None
+        
+        try:
+            fallback_key = settings.FALLBACK_LLM_API_KEY or settings.GROQ_API_KEY
+            secret_key = SecretStr(fallback_key) if isinstance(fallback_key, str) else fallback_key
+            return ChatGroq(
+                model=settings.FALLBACK_LLM_MODEL,
+                temperature=0.1,
+                api_key=secret_key
+            )
+        except Exception as e:
+            logger.warning(f"Failed to create fallback LLM: {e}")
+            return None
+    
+    async def _invoke_with_fallback(self, messages: list) -> object:
+        """
+        Invoke LLM with automatic fallback on provider errors.
+        
+        Catches rate limits (429), auth errors (401/402), and server errors (500-504)
+        and retries with fallback LLM if available.
+        """
+        try:
+            response = await self.llm.ainvoke(messages)
+            # If we were using fallback and primary works again, switch back
+            if self._using_fallback:
+                logger.info("Primary LLM recovered, switching back")
+                self._using_fallback = False
+            return response
+        except Exception as e:
+            error_str = str(e).lower()
+            is_provider_error = any(code in error_str for code in [
+                '429', '401', '402', '500', '502', '503', '504',
+                'rate limit', 'rate_limit', 'quota', 'too many requests',
+                'server error', 'internal server error', 'service unavailable'
+            ])
+            
+            if is_provider_error and self._fallback_llm:
+                logger.warning(f"Primary LLM failed ({e}), switching to fallback")
+                self._using_fallback = True
+                try:
+                    return await self._fallback_llm.ainvoke(messages)
+                except Exception as fallback_err:
+                    logger.error(f"Fallback LLM also failed: {fallback_err}")
+                    raise  # Re-raise fallback error
+            
+            raise  # Re-raise original error if not a provider error or no fallback
 
     async def run(self, user_request: str, headless: bool = False):
         """Main entry point: Plan and Execute."""
@@ -104,7 +157,7 @@ class AutomationAgent:
         """
         
         try:
-            response = await self.llm.ainvoke([
+            response = await self._invoke_with_fallback([
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_request}
             ])
@@ -172,9 +225,61 @@ class DynamicAutomationAgent:
             api_key=secret_api_key
         )
         
+        self._fallback_llm = self._create_fallback_llm()
+        self._using_fallback = False
+        
         self.max_steps = max_steps or settings.MAX_AGENT_STEPS
         self.enable_self_correction = enable_self_correction if enable_self_correction is not None else settings.ENABLE_SELF_CORRECTION
         self.action_history: List[Dict[str, Any]] = []
+    
+    def _create_fallback_llm(self):
+        """Create fallback LLM if configured."""
+        if not settings.ENABLE_LLM_FALLBACK or not settings.FALLBACK_LLM_MODEL:
+            return None
+        
+        try:
+            fallback_key = settings.FALLBACK_LLM_API_KEY or settings.GROQ_API_KEY
+            secret_key = SecretStr(fallback_key) if isinstance(fallback_key, str) else fallback_key
+            return ChatGroq(
+                model=settings.FALLBACK_LLM_MODEL,
+                temperature=0.1,
+                api_key=secret_key
+            )
+        except Exception as e:
+            logger.warning(f"Failed to create fallback LLM: {e}")
+            return None
+    
+    async def _invoke_with_fallback(self, messages: list) -> object:
+        """
+        Invoke LLM with automatic fallback on provider errors.
+        
+        Catches rate limits (429), auth errors (401/402), and server errors (500-504)
+        and retries with fallback LLM if available.
+        """
+        try:
+            response = await self.llm.ainvoke(messages)
+            if self._using_fallback:
+                logger.info("Primary LLM recovered, switching back")
+                self._using_fallback = False
+            return response
+        except Exception as e:
+            error_str = str(e).lower()
+            is_provider_error = any(code in error_str for code in [
+                '429', '401', '402', '500', '502', '503', '504',
+                'rate limit', 'rate_limit', 'quota', 'too many requests',
+                'server error', 'internal server error', 'service unavailable'
+            ])
+            
+            if is_provider_error and self._fallback_llm:
+                logger.warning(f"Primary LLM failed ({e}), switching to fallback")
+                self._using_fallback = True
+                try:
+                    return await self._fallback_llm.ainvoke(messages)
+                except Exception as fallback_err:
+                    logger.error(f"Fallback LLM also failed: {fallback_err}")
+                    raise
+            
+            raise
     
     async def run_dynamic(self, user_goal: str, headless: bool = False):
         """
@@ -537,7 +642,7 @@ Respond with ONLY a JSON object (no markdown):
 """
 
         try:
-            response = await self.llm.ainvoke([{"role": "user", "content": prompt}])
+            response = await self._invoke_with_fallback([{"role": "user", "content": prompt}])
             
             # Parse response
             content = response.content if isinstance(response.content, str) else str(response.content)
@@ -664,7 +769,7 @@ Respond with ONLY a JSON object (no markdown, no backticks):
 Or return {{"action": "give_up"}} if no correction is possible."""
 
         try:
-            response = await self.llm.ainvoke([{"role": "user", "content": prompt}])
+            response = await self._invoke_with_fallback([{"role": "user", "content": prompt}])
             content = response.content if isinstance(response.content, str) else str(response.content)
             
             corrected = parse_json_safely(content)
