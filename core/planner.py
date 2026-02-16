@@ -2,13 +2,14 @@ import json
 import os
 import time
 import asyncio
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 from langchain_groq import ChatGroq
 from pydantic import SecretStr  
 from config.settings import settings
 from utils.logger import setup_logger
 from utils.helpers import parse_json_safely
 from tools.automation_tools import execute_intelligent_parallel_tasks
+from models.actions import AgentOutput, parse_agent_output
 
 logger = setup_logger(__name__)
 
@@ -542,13 +543,20 @@ Respond with ONLY a JSON object (no markdown):
             content = response.content if isinstance(response.content, str) else str(response.content)
             
             # Try to extract JSON
-            action = parse_json_safely(content)
+            raw_action = parse_json_safely(content)
             
-            if action and 'action' in action:
-                return action
+            if not raw_action or 'action' not in raw_action:
+                logger.error(f"Invalid action format from LLM: {content}")
+                return None
             
-            logger.error(f"Invalid action format from LLM: {content}")
-            return None
+            # Validate with Pydantic model (graceful fallback to raw dict)
+            try:
+                agent_output = parse_agent_output(raw_action)
+                logger.debug(f"Validated action: {agent_output.action} (params validated: {agent_output.params is not None})")
+                return agent_output
+            except Exception as validation_err:
+                logger.warning(f"Action validation warning (using raw dict): {validation_err}")
+                return raw_action
             
         except Exception as e:
             logger.error(f"Failed to decide next action: {e}")
@@ -661,11 +669,17 @@ Or return {{"action": "give_up"}} if no correction is possible."""
             
             corrected = parse_json_safely(content)
             
-            if corrected and corrected.get('action') != 'give_up':
-                logger.info(f"Agent suggested correction: {corrected.get('action')}")
-                return corrected
+            if not corrected or corrected.get('action') == 'give_up':
+                return None
             
-            return None
+            # Validate corrected action with Pydantic
+            try:
+                agent_output = parse_agent_output(corrected)
+                logger.info(f"Agent suggested correction: {agent_output.action}")
+                return agent_output
+            except Exception:
+                logger.info(f"Agent suggested correction: {corrected.get('action')} (raw)")
+                return corrected
             
         except Exception as e:
             logger.error(f"Failed to get correction: {e}")
