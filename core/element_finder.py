@@ -8,6 +8,7 @@ from pydantic import SecretStr
 from utils.logger import setup_logger
 from utils.helpers import extract_number
 from config.settings import settings
+from core.cdp_dom import CDPDomProcessor, CDPElement
 
 logger = setup_logger(__name__)
 
@@ -70,7 +71,7 @@ class IntelligentElementFinder:
             Dictionary with success status, element data, and selector
         """
         try:
-            # Get all interactive elements first
+            # Get all interactive elements — CDP first, JS fallback
             all_elements = await self._get_interactive_elements(page)
             
             if not all_elements:
@@ -79,8 +80,8 @@ class IntelligentElementFinder:
             
             logger.info(f"Found {len(all_elements)} total interactive elements")
             
-            # === TIER 1: DOM-BASED AI MATCHING (Fast) ===
-            logger.debug("Attempting DOM-based element finding...")
+            # === TIER 1: AI MATCHING on CDP/JS elements (Fast) ===
+            logger.debug("Attempting element finding...")
             
             # Try viewport elements first
             viewport_elements = self._filter_by_viewport(all_elements)
@@ -330,7 +331,26 @@ class IntelligentElementFinder:
     # ========================================
     
     async def _get_interactive_elements(self, page: Page) -> List[Dict]:
-        """Extract and analyze interactive elements from the page."""
+        """
+        Get interactive elements using CDP (primary) with JS fallback.
+        
+        Returns elements as dicts compatible with AI matching methods.
+        """
+        # Try CDP-based discovery first (more comprehensive)
+        try:
+            cdp_elements = await CDPDomProcessor.get_interactive_elements(page)
+            if cdp_elements:
+                logger.info(f"CDP discovery found {len(cdp_elements)} interactive elements")
+                return [elem.to_dict() for elem in cdp_elements]
+        except Exception as e:
+            logger.debug(f"CDP discovery failed, falling back to JS: {e}")
+        
+        # Fallback to JS-based discovery
+        logger.info("Using JS-based element discovery (fallback)")
+        return await self._get_interactive_elements_js(page)
+    
+    async def _get_interactive_elements_js(self, page: Page) -> List[Dict]:
+        """JS-based element extraction (fallback for non-Chromium browsers)."""
         elements_data = await page.evaluate("""
             () => {
                 const elements = [];
@@ -369,14 +389,12 @@ class IntelligentElementFinder:
                                     const testId = element.getAttribute('data-testid');
                                     if (testId) return `[data-testid="${testId}"]`;
                                     
-                                    // Combine tag + type + placeholder for inputs
                                     if (element.tagName === 'INPUT' && element.type) {
                                         if (element.placeholder) 
                                             return `input[type="${element.type}"][placeholder="${element.placeholder}"]`;
                                         return `input[type="${element.type}"]`;
                                     }
                                     
-                                    // Use role attribute if available
                                     const role = element.getAttribute('role');
                                     if (role) {
                                         const text = element.textContent?.trim();
@@ -386,7 +404,6 @@ class IntelligentElementFinder:
                                         return `[role="${role}"]`;
                                     }
                                     
-                                    // Fallback with parent context
                                     const tagName = element.tagName.toLowerCase();
                                     const parent = element.parentNode;
                                     if (parent) {
