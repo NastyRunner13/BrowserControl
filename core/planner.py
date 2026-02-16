@@ -10,6 +10,7 @@ from utils.logger import setup_logger
 from utils.helpers import parse_json_safely
 from tools.automation_tools import execute_intelligent_parallel_tasks
 from models.actions import AgentOutput, parse_agent_output
+from models.plan import AgentPlan
 
 logger = setup_logger(__name__)
 
@@ -231,6 +232,8 @@ class DynamicAutomationAgent:
         self.max_steps = max_steps or settings.MAX_AGENT_STEPS
         self.enable_self_correction = enable_self_correction if enable_self_correction is not None else settings.ENABLE_SELF_CORRECTION
         self.action_history: List[Dict[str, Any]] = []
+        self.plan: Optional[AgentPlan] = None
+        self.consecutive_failures: int = 0
     
     def _create_fallback_llm(self):
         """Create fallback LLM if configured."""
@@ -348,6 +351,20 @@ class DynamicAutomationAgent:
                     print("❌ Failed to decide next action")
                     break
                 
+                # Update plan from LLM response (if it provided one)
+                plan_items = next_action.get('plan')
+                if plan_items and isinstance(plan_items, list):
+                    str_items = [str(item) for item in plan_items if item]
+                    if str_items:
+                        if self.plan is None:
+                            self.plan = AgentPlan.from_text_list(str_items, step_number=step_count)
+                            logger.info(f"📋 Plan created with {len(str_items)} steps")
+                            print(f"📋 Plan created ({len(str_items)} steps)")
+                        else:
+                            self.plan.update_plan(str_items, step_number=step_count)
+                            logger.info(f"📋 Plan revised (revision #{self.plan.revision_count})")
+                            print(f"📋 Plan revised (revision #{self.plan.revision_count})")
+                
                 # Loop detection: if the same action+description repeats 3+ times, force final_answer
                 action_key = f"{next_action.get('action')}:{next_action.get('description', '')}"
                 recent_actions = [
@@ -425,8 +442,15 @@ class DynamicAutomationAgent:
                 status = execution_result.get('status', 'unknown')
                 if status == 'success':
                     print(f"✓ Success")
+                    self.consecutive_failures = 0
+                    # Advance plan on success
+                    if self.plan and not self.plan.is_complete:
+                        self.plan.advance()
                 elif status == 'failed':
                     print(f"✗ Failed: {execution_result.get('error', 'Unknown error')}")
+                    self.consecutive_failures += 1
+                    if self.plan and not self.plan.is_complete:
+                        self.plan.mark_current_failed()
                 
                 # Check if we should abort
                 if execution_result.get('status') == 'critical_failure':
@@ -604,6 +628,8 @@ CURRENT STATE:
 HISTORY (Recent Actions):
 {history_text if history_text else 'No actions yet'}
 {extracted_data_text}
+{self.plan.format_for_prompt() if self.plan else 'No plan yet — create one with your first action.'}
+{('⚠️ You have failed ' + str(self.consecutive_failures) + ' consecutive actions. Consider replanning.') if self.consecutive_failures >= 2 else ''}
 AVAILABLE ACTIONS:
 - navigate: Go to URL {{"action": "navigate", "url": "https://..."}}
 - intelligent_click: Click element {{"action": "intelligent_click", "description": "what to click"}}
@@ -636,7 +662,8 @@ Respond with ONLY a JSON object (no markdown):
   "direction": "down" (for scroll),
   "amount": 500 (for scroll),
   "answer": "..." (for final_answer),
-  "reasoning": "why this action"
+  "reasoning": "why this action",
+  "plan": ["step 1 description", "step 2 description", ...] (ONLY include on first action or when replanning)
 }}
 
 """
