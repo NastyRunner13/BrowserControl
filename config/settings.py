@@ -71,6 +71,10 @@ class Settings:
     # Cost Control
     MAX_LLM_CALLS_PER_TASK = int(os.getenv("MAX_LLM_CALLS_PER_TASK", "100"))
     
+    # Message Management
+    MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "8000"))
+    ENABLE_MESSAGE_COMPACTION = os.getenv("ENABLE_MESSAGE_COMPACTION", "true").lower() == "true"
+    
     # ==========================================
     # SECURITY CONFIGURATION
     # ==========================================

@@ -11,6 +11,7 @@ from utils.helpers import parse_json_safely
 from tools.automation_tools import execute_intelligent_parallel_tasks
 from models.actions import AgentOutput, parse_agent_output
 from models.plan import AgentPlan
+from core.message_manager import MessageManager
 
 logger = setup_logger(__name__)
 
@@ -234,6 +235,12 @@ class DynamicAutomationAgent:
         self.action_history: List[Dict[str, Any]] = []
         self.plan: Optional[AgentPlan] = None
         self.consecutive_failures: int = 0
+        
+        # Message management for token-aware compaction
+        self.message_manager = MessageManager(
+            max_tokens=settings.MAX_CONTEXT_TOKENS,
+            preserve_recent=4,
+        ) if settings.ENABLE_MESSAGE_COMPACTION else None
     
     def _create_fallback_llm(self):
         """Create fallback LLM if configured."""
@@ -673,6 +680,14 @@ Respond with ONLY a JSON object (no markdown):
             
             # Parse response
             content = response.content if isinstance(response.content, str) else str(response.content)
+            
+            # Record in message manager for token tracking
+            if self.message_manager:
+                self.message_manager.add_user_message(prompt)
+                self.message_manager.add_assistant_message(content)
+                stats = self.message_manager.get_stats()
+                if stats["message_count"] % 10 == 0:  # Log every 5 exchanges
+                    logger.info(f"Message stats: {stats}")
             
             # Try to extract JSON
             raw_action = parse_json_safely(content)
