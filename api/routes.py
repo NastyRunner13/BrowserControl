@@ -1,7 +1,7 @@
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, Depends
 from api.schemas import TaskRequest, TaskSubmissionResponse, TaskResult, TaskStatus
 from api.manager import job_manager
-from core.planner import AutomationAgent
+from core.planner import AutomationAgent, DynamicAutomationAgent
 from core.browser_pool import BrowserPool
 from tools.automation_tools import execute_intelligent_parallel_tasks
 import json
@@ -11,11 +11,26 @@ router = APIRouter()
 
 async def process_automation_task(job_id: str, request: TaskRequest, pool: BrowserPool):
     """
-    Background worker function.
+    Background worker function. Supports both linear and dynamic execution modes.
     """
     job_manager.update_status(job_id, TaskStatus.PROCESSING)
     
     try:
+        if request.mode == "dynamic":
+            # Use dynamic agent (adaptive, step-by-step)
+            dynamic_agent = DynamicAutomationAgent()
+            result = await dynamic_agent.run_dynamic(
+                request.prompt, 
+                headless=request.headless
+            )
+            final_output = {
+                "summary": result if isinstance(result, str) else str(result),
+                "mode": "dynamic"
+            }
+            job_manager.update_status(job_id, TaskStatus.COMPLETED, result=final_output)
+            return
+
+        # Linear mode: plan-then-execute
         # 1. Plan the task (if prompt provided)
         tasks_json = None
         

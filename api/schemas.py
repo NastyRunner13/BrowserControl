@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, field_validator
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
 from enum import Enum
 from datetime import datetime
 
@@ -12,6 +12,7 @@ class TaskStatus(str, Enum):
 class TaskRequest(BaseModel):
     prompt: str = Field(..., description="Natural language description of the automation task")
     headless: bool = Field(True, description="Run browser in headless mode")
+    mode: Literal["linear", "dynamic"] = Field("linear", description="Execution mode: 'linear' (plan-then-execute) or 'dynamic' (adaptive step-by-step)")
     # Optional: Allow passing direct structured steps if bypassing the LLM planner
     structured_steps: Optional[List[Dict[str, Any]]] = None
     

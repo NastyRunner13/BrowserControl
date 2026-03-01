@@ -21,7 +21,7 @@ class Settings:
     # ==========================================
     # LLM CONFIGURATION
     # ==========================================
-    LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
+    LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
     LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.1"))
     
     # Vision LLM
@@ -33,6 +33,11 @@ class Settings:
         "llama-3.2-90b-vision-preview",
         "llama-3.2-11b-vision-preview"
     ]
+    
+    # Fallback LLM (activated on rate limits / provider errors)
+    ENABLE_LLM_FALLBACK = os.getenv("ENABLE_LLM_FALLBACK", "true").lower() == "true"
+    FALLBACK_LLM_MODEL = os.getenv("FALLBACK_LLM_MODEL", "")
+    FALLBACK_LLM_API_KEY = os.getenv("FALLBACK_LLM_API_KEY", "")
     
     # ==========================================
     # EXECUTION CONFIGURATION
@@ -66,6 +71,10 @@ class Settings:
     # Cost Control
     MAX_LLM_CALLS_PER_TASK = int(os.getenv("MAX_LLM_CALLS_PER_TASK", "100"))
     
+    # Message Management
+    MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "8000"))
+    ENABLE_MESSAGE_COMPACTION = os.getenv("ENABLE_MESSAGE_COMPACTION", "true").lower() == "true"
+    
     # ==========================================
     # SECURITY CONFIGURATION
     # ==========================================
@@ -98,7 +107,8 @@ class Settings:
             "dynamic_agent": Settings.ENABLE_DYNAMIC_AGENT,
             "self_correction": Settings.ENABLE_SELF_CORRECTION,
             "persistent_context": Settings.ENABLE_PERSISTENT_CONTEXT,
-            "vision_fallback": Settings.ENABLE_VISION_FALLBACK
+            "vision_fallback": Settings.ENABLE_VISION_FALLBACK,
+            "llm_fallback": Settings.ENABLE_LLM_FALLBACK
         }
     
     # ==========================================
@@ -144,7 +154,14 @@ class Settings:
         if Settings.BROWSER_TIMEOUT < 5000:
             warnings.append("BROWSER_TIMEOUT is very low - may cause timeouts")
         
-        # 4. Security warnings
+        # 4. Fallback LLM validation
+        if Settings.ENABLE_LLM_FALLBACK and not Settings.FALLBACK_LLM_MODEL:
+            warnings.append(
+                "LLM_FALLBACK is enabled but FALLBACK_LLM_MODEL is not set. "
+                "Set FALLBACK_LLM_MODEL and FALLBACK_LLM_API_KEY in .env for auto-failover."
+            )
+        
+        # 5. Security warnings
         if Settings.ENABLE_PERSISTENT_CONTEXT:
             warnings.append(
                 "⚠️  PERSISTENT_CONTEXT is enabled. This stores auth tokens on disk. "
